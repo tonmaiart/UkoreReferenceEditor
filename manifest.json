@@ -1,0 +1,9 @@
+{
+  "id": "ukore_reference_editor",
+  "name": "UkoreReferenceEditor",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry_point": "plugin.py",
+  "description": "Maya-side tool that redirects broken references/textures built around the old absolute-path convention onto UkoreHub's current per-repo layout, and tracks/updates outdated Maya file references against the studio's vXXX publish-version folders. Contributes its maya-scripts folder (plus UkoreHub's own app root) to the Maya Launcher env bridge — does not launch Maya itself and has no UI of its own inside UkoreHub.",
+  "requires": ["maya_toolkit", "publish_api"]
+}
