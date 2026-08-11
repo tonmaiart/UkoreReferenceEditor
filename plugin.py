@@ -30,3 +30,11 @@ def register(api) -> None:
     labels = bridge.get("labels", {})
     labels[TOOL_ID] = TOOL_LABEL
     bridge.set("labels", labels)
+
+    # เพิ่มส่วนนี้เข้าไปใน UkoreReferenceEditor/plugin.py
+    hooks = bridge.get("launch_hooks", {})
+    hooks[TOOL_ID] = {
+        "order": 10,  # ให้รัน import ก่อนตัว UkoreMenu (order: 99) จะสั่ง rebuild_menu
+        "post_open_mel": 'python("try:\\n    import UkoreReferenceEditor\\nexcept ImportError:\\n    pass");',
+    }
+    bridge.set("launch_hooks", hooks)
