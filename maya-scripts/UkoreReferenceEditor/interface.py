@@ -1,8 +1,9 @@
 """Ukore Reference Editor's UI — loads widget.ui (Qt Designer) and wires its
 tables/buttons/info panels to core.py's scan/redirect functions, split into
-two tabs ("Maya File" for references, "Textures" for file-texture nodes)
-since those need different redirect calls (loadReference vs. setAttr) but
-share the exact same scan/classify algorithm underneath. Not built on
+three tabs ("Maya File" for references, "Textures" for file-texture nodes,
+"Audio" for `audio` nodes) since references need a different redirect call
+(loadReference vs. setAttr for textures/audio) but all three share the
+exact same scan/classify algorithm underneath. Not built on
 tmlib.ui.interface_template's ToolkitWindow (which expects a toolkit
 package with a ui.ui file discoverable by name via File.load_ui_external) —
 widget.ui is loaded directly via tmlib.core.File.load_ui instead, same
@@ -56,6 +57,9 @@ _REF_COLUMNS = ["Loaded", "Status", "Reference Node", "File", "Version", "Next V
 
 _TEX_COLUMNS = ["Status", "File", "Scope"]
 _TEX_COL_STATUS, _TEX_COL_FILE, _TEX_COL_SCOPE = range(len(_TEX_COLUMNS))
+
+_AUDIO_COLUMNS = ["Status", "Node Name", "File", "Scope"]
+_AUDIO_COL_STATUS, _AUDIO_COL_NODE, _AUDIO_COL_FILE, _AUDIO_COL_SCOPE = range(len(_AUDIO_COLUMNS))
 
 
 def _get_maya_window():
@@ -507,6 +511,120 @@ class _TextureTab:
             self.reload_table()
 
 
+class _AudioTab:
+    """Wires the "Audio" tab's tableWidget_audio, its Auto Resolve/Change
+    Audio Path buttons, and its Audio File Info line edits — same shape as
+    _TextureTab (Rescan always applies the safe auto-fix pass; no separate
+    manual-only rescan), just against `audio` nodes' filename attribute
+    instead of file-texture nodes."""
+
+    def __init__(self, ui):
+        self.table: QtWidgets.QTableWidget = ui.tableWidget_audio
+        self._entries: list = []
+
+        _set_table_columns(self.table, _AUDIO_COLUMNS, stretch_column="File", wide_columns={"Node Name": 180})
+        self.table.itemSelectionChanged.connect(self._update_info_panel)
+
+        self._info_lines = (
+            ui.lineEdit_absolute_audio_path,
+            ui.lineEdit_audio_status,
+            ui.lineEdit_audio_repo_scope,
+        )
+        for line_edit in self._info_lines:
+            line_edit.setReadOnly(True)
+        self._clear_info_panel()
+
+        ui.pushButton_rescan_audio.clicked.connect(self.reload_table)
+        ui.pushButton_change_audio_path.clicked.connect(self._on_change_audio_path)
+
+    def reload_table(self):
+        print(f"{_LOG_PREFIX} [Audio] scanning...")
+        try:
+            entries = core.scan_audio()
+            fixed = core.auto_fix_entries(entries, self._redirect)
+            if fixed:
+                print(f"{_LOG_PREFIX} [Audio] auto-fixed {fixed} entrie(s), rescanning...")
+                entries = core.scan_audio()
+            self._entries = entries
+        except Exception as exc:
+            traceback.print_exc()
+            cmds.warning(f"{_LOG_PREFIX} [Audio] Rescan failed: {exc}")
+            self.table.setRowCount(0)
+            return
+
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self._entries))
+            for row, entry in enumerate(self._entries):
+                status_item = QtWidgets.QTableWidgetItem(_STATUS_LABELS.get(entry.status, entry.status))
+                status_item.setIcon(_status_icon(entry.status))
+                self.table.setItem(row, _AUDIO_COL_STATUS, status_item)
+
+                self.table.setItem(row, _AUDIO_COL_NODE, QtWidgets.QTableWidgetItem(entry.node_name))
+
+                filename_item = QtWidgets.QTableWidgetItem(Path(entry.file_path).name if entry.file_path else "")
+                filename_item.setToolTip(entry.file_path or "")
+                self.table.setItem(row, _AUDIO_COL_FILE, filename_item)
+
+                self.table.setItem(row, _AUDIO_COL_SCOPE, QtWidgets.QTableWidgetItem(_SCOPE_LABELS[entry.scope]))
+        finally:
+            self.table.blockSignals(False)
+
+        self._clear_info_panel()
+
+    @staticmethod
+    def _redirect(entry, new_path) -> bool:
+        return core.redirect_audio(entry.node_name, entry.attr_name, new_path)
+
+    def _clear_info_panel(self):
+        for line_edit in self._info_lines:
+            line_edit.setText("")
+
+    def _update_info_panel(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            self._clear_info_panel()
+            return
+        entry = self._entries[rows[0]]
+        path, status, scope = self._info_lines
+        path.setText(entry.file_path or "")
+        status.setText(_STATUS_LABELS.get(entry.status, entry.status))
+        scope.setText(_SCOPE_LABELS[entry.scope])
+
+    def _on_change_audio_path(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            cmds.warning(f"{_LOG_PREFIX} [Audio] Change Audio Path: select exactly one audio row.")
+            return
+        entry = self._entries[rows[0]]
+
+        starting_dir = ""
+        if entry.file_path:
+            parent = Path(entry.file_path).parent
+            if parent.is_dir():
+                starting_dir = str(parent)
+
+        chosen = cmds.fileDialog2(
+            fileMode=1,
+            dialogStyle=2,
+            caption="Change Audio Path",
+            fileFilter="Audio Files (*.wav *.aiff *.aif *.mp3);;All Files (*.*)",
+            okCaption="Select",
+            startingDirectory=starting_dir,
+        )
+        if not chosen:
+            return
+
+        resolved = matcher.resolve_manual_target(entry.file_path, Path(chosen[0]))
+        if resolved is None:
+            cmds.warning(f"{_LOG_PREFIX} [Audio] Change Audio Path: {chosen[0]!r} is not a valid file.")
+            return
+
+        ok = core.redirect_audio(entry.node_name, entry.attr_name, resolved)
+        print(f"{_LOG_PREFIX} [Audio] Change Audio Path: {entry.file_path!r} -> {resolved!r} returned {ok}")
+        self.reload_table()
+
+
 class MainWindow(MayaQWidgetDockableMixin, QtWidgets.QMainWindow):
     WINDOW_OBJECT = "UkoreReferenceEditor"
 
@@ -543,6 +661,8 @@ class MainWindow(MayaQWidgetDockableMixin, QtWidgets.QMainWindow):
 
         self.reference_tab = _ReferenceTab(self.ui)
         self.texture_tab = _TextureTab(self.ui)
+        self.audio_tab = _AudioTab(self.ui)
 
         self.reference_tab.reload_table()
         self.texture_tab.reload_table()
+        self.audio_tab.reload_table()

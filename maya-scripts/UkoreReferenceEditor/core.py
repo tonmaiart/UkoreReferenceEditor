@@ -3,16 +3,17 @@ layer. `interface.py` (manual UI) and `maya-plug-ins/ukoreMaya.py`'s
 automatic scene-open callback both call into this module rather than
 duplicating the scan/redirect logic.
 
-Two independent kinds of broken path get the exact same
+Three independent kinds of broken path get the exact same
 matcher.find_match_for_path/resolve_redirect algorithm applied: Maya file
-references (`scan_references`/`RefEntry`) and file-texture nodes' own
-fileTextureName attribute (`scan_textures`/`TextureEntry`) — the only real
+references (`scan_references`/`RefEntry`), file-texture nodes' own
+fileTextureName attribute (`scan_textures`/`TextureEntry`), and `audio`
+nodes' own filename attribute (`scan_audio`/`AudioEntry`) — the only real
 difference between them is *how* a fix gets applied (`redirect_reference`'s
-`loadReference` vs. `redirect_texture`'s `setAttr`), so `_classify_path`
-holds the one shared scope/suggested-path algorithm both entry builders
-call, and `_sort_for_auto_fix`/`_confirm_redirect` hold the one shared
-auto-redirect/confirm-dialog policy `auto_check_and_redirect` applies to
-both lists.
+`loadReference` vs. `redirect_texture`'s/`redirect_audio`'s `setAttr`), so
+`_classify_path` holds the one shared scope/suggested-path algorithm every
+entry builder calls, and `_sort_for_auto_fix`/`_confirm_redirect` hold the
+one shared auto-redirect/confirm-dialog policy `auto_check_and_redirect`
+applies to all three lists.
 
 `RefEntry` also carries a `status` or `"outdated"` on top of `exists` —
 whether a newer published version (a sibling vNNN folder) exists for a
@@ -299,6 +300,77 @@ def _build_texture_entry(node_name: str, active_repo, projects: list, root_ws: s
     )
 
 
+_AUDIO_NODE_TYPE = "audio"
+_AUDIO_ATTR = "filename"
+
+
+@dataclass
+class AudioEntry:
+    file_path: str
+    node_name: str
+    attr_name: str
+    exists: bool
+    scope: str  # "internal" | "external" | "unmatched"
+    status: str  # "missing" | "ok" — same shape as TextureEntry, no version-check concept
+    matched_project: object | None = None
+    matched_repo: object | None = None
+    suggested_path: Path | None = None
+
+
+def scan_audio() -> list[AudioEntry]:
+    """Every Maya `audio` node's own `filename` attribute in the scene,
+    classified with the exact same matcher.find_match_for_path/resolve_redirect
+    algorithm scan_references/scan_textures use — same shape as
+    scan_textures, just a different node type/attribute to read and setAttr
+    through (redirect_audio)."""
+    node_names = cmds.ls(type=_AUDIO_NODE_TYPE) or []
+    print(f"{_LOG_PREFIX} scan_audio: found {len(node_names)} audio node(s): {node_names}")
+
+    active_project, active_repo, _active_repo_path = repo_paths.get_active_repo()
+    projects = repo_paths.list_all_projects()
+    root_ws = repo_paths.workspace_root()
+
+    entries: list[AudioEntry] = []
+    for node_name in node_names:
+        try:
+            entries.append(_build_audio_entry(node_name, active_repo, projects, root_ws))
+        except Exception:
+            print(f"{_LOG_PREFIX} scan_audio: failed to process {node_name!r}, skipping it:")
+            traceback.print_exc()
+
+    return entries
+
+
+def _build_audio_entry(node_name: str, active_repo, projects: list, root_ws: str | None) -> AudioEntry:
+    attr = f"{node_name}.{_AUDIO_ATTR}"
+    raw_path = cmds.getAttr(attr) or ""
+    clean_path = _normalized(raw_path) if raw_path else ""
+    exists = os.path.exists(clean_path) if clean_path else False
+
+    scope, matched_project, matched_repo, suggested_path = _classify_path(
+        clean_path, exists, active_repo, projects, root_ws
+    )
+    status = "ok" if exists else "missing"
+
+    matched_repo_name = matched_repo.name if matched_repo else None
+    print(
+        f"{_LOG_PREFIX} scan_audio:   {node_name} -> {clean_path!r} status={status} "
+        f"repo={matched_repo_name!r} scope={scope} suggested={suggested_path}"
+    )
+
+    return AudioEntry(
+        file_path=clean_path,
+        node_name=node_name,
+        attr_name=_AUDIO_ATTR,
+        exists=exists,
+        scope=scope,
+        status=status,
+        matched_project=matched_project,
+        matched_repo=matched_repo,
+        suggested_path=suggested_path,
+    )
+
+
 def get_active_repo_info() -> tuple[str, str]:
     """(repo_name, repo_absolute_path) for the repo currently active/open in
     Maya, or ("", "") if none is active — backs the manual UI's shared
@@ -401,6 +473,19 @@ def redirect_texture(node_name: str, attr_name: str, new_path: Path) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001 - a bad redirect must not break the rest of the batch
         cmds.warning(f"Failed to redirect texture: {attr} -> {new_path}\n{exc}")
+        return False
+
+
+def redirect_audio(node_name: str, attr_name: str, new_path: Path) -> bool:
+    """setAttr's an `audio` node's filename attribute to the resolved
+    location — same shape as redirect_texture, no reference node/load step
+    involved."""
+    attr = f"{node_name}.{attr_name}"
+    try:
+        cmds.setAttr(attr, str(new_path), type="string")
+        return True
+    except Exception as exc:  # noqa: BLE001 - a bad redirect must not break the rest of the batch
+        cmds.warning(f"Failed to redirect audio: {attr} -> {new_path}\n{exc}")
         return False
 
 
@@ -544,6 +629,7 @@ def auto_check_and_redirect() -> bool:
     `menu_utils.ukore_reference_editor()` the menu item itself uses."""
     ref_entries = scan_references()
     texture_entries = scan_textures()
+    audio_entries = scan_audio()
 
     connect_input_targets: list[Path] | None = None
 
@@ -572,18 +658,24 @@ def auto_check_and_redirect() -> bool:
 
     missing_refs = [e for e in ref_entries if e.status == "missing"]
     missing_textures = [e for e in texture_entries if e.status == "missing"]
+    missing_audio = [e for e in audio_entries if e.status == "missing"]
 
     ref_auto, ref_confirm = _sort_for_auto_fix(missing_refs, get_connect_input_targets)
     texture_auto, texture_confirm = _sort_for_auto_fix(missing_textures, get_connect_input_targets)
+    audio_auto, audio_confirm = _sort_for_auto_fix(missing_audio, get_connect_input_targets)
 
     texture_fixed = 0
+    audio_fixed = 0
     for entry in ref_auto:
         _deferred_load(redirect_reference, entry.ref_node, entry.suggested_path)
     for entry in texture_auto:
         if redirect_texture(entry.node_name, entry.attr_name, entry.suggested_path):
             texture_fixed += 1
+    for entry in audio_auto:
+        if redirect_audio(entry.node_name, entry.attr_name, entry.suggested_path):
+            audio_fixed += 1
 
-    total_auto = len(ref_auto) + len(texture_auto)
+    total_auto = len(ref_auto) + len(texture_auto) + len(audio_auto)
     if total_auto:
         cmds.inViewMessage(
             amg=f"<hl>{_DIALOG_TITLE}</hl> auto-redirected {total_auto} file(s).",
@@ -592,6 +684,7 @@ def auto_check_and_redirect() -> bool:
         )
         lines = [f"- {e.ref_path} -> {e.suggested_path}" for e in ref_auto]
         lines += [f"- {e.file_path} -> {e.suggested_path}" for e in texture_auto]
+        lines += [f"- {e.file_path} -> {e.suggested_path}" for e in audio_auto]
         print(f"# {_DIALOG_TITLE} auto-redirected:\n" + "\n".join(lines))
 
     for entry in ref_confirm:
@@ -601,6 +694,11 @@ def auto_check_and_redirect() -> bool:
         if _confirm_redirect(entry.file_path, entry.suggested_path):
             if redirect_texture(entry.node_name, entry.attr_name, entry.suggested_path):
                 texture_fixed += 1
+    for entry in audio_confirm:
+        if _confirm_redirect(entry.file_path, entry.suggested_path):
+            if redirect_audio(entry.node_name, entry.attr_name, entry.suggested_path):
+                audio_fixed += 1
 
     still_missing_textures = len(missing_textures) - texture_fixed
-    return bool(ref_entries) or still_missing_textures > 0
+    still_missing_audio = len(missing_audio) - audio_fixed
+    return bool(ref_entries) or still_missing_textures > 0 or still_missing_audio > 0
