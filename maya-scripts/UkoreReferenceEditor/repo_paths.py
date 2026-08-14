@@ -11,6 +11,7 @@ this import is always safe."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PublishApi import repo_paths as publish_api_paths
@@ -22,9 +23,19 @@ get_custom_path = publish_api_paths.get_custom_path
 
 
 def find_ukorehub_root() -> Path:
-    """This file lives at plugins/repo_internal/UkoreReferenceEditor/maya-scripts/
-    UkoreReferenceEditor/repo_paths.py — five parents up is the UkoreHub
-    repo root, same depth as PublishApi's own repo_paths.py."""
+    """The real app root (holds data/), not necessarily an ancestor of this
+    plugin's own location — cache/plugins/ is deliberately allowed to live
+    outside it (see app/launcher.py's UKOREHUB_APP_ROOT export). Maya
+    inherits UKOREHUB_APP_ROOT from the launching UkoreHub process's env;
+    the parent-climb (this file lives at cache/plugins/UkoreReferenceEditor/
+    maya-scripts/UkoreReferenceEditor/repo_paths.py — five parents up is the
+    UkoreHub root, same depth as PublishApi's own repo_paths.py) is only a
+    fallback for a mayapy session started without that env var. Same fix
+    PublishApi.repo_paths.find_ukorehub_root() already has — this copy had
+    fallen out of sync with it."""
+    env_root = os.environ.get("UKOREHUB_APP_ROOT")
+    if env_root:
+        return Path(env_root)
     return Path(__file__).resolve().parents[5]
 
 

@@ -529,7 +529,15 @@ class MainWindow(MayaQWidgetDockableMixin, QtWidgets.QMainWindow):
 
         self.ui.lineEdit_current_repo_name.setReadOnly(True)
         self.ui.lineEdit_current_repo_path.setReadOnly(True)
+        # Re-fetched fresh (not cached) every time this window opens, since
+        # the active repo can change between launches without this window
+        # having been open to see it happen.
         repo_name, repo_path = core.get_active_repo_info()
+        if not repo_name:
+            cmds.warning(
+                f"{_LOG_PREFIX} No active repo detected — Current Repo Name/Absolute Path will stay blank. "
+                "Check that a Project/Repo is selected as active in UkoreHub."
+            )
         self.ui.lineEdit_current_repo_name.setText(repo_name)
         self.ui.lineEdit_current_repo_path.setText(repo_path)
 
