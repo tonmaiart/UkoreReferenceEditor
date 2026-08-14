@@ -532,7 +532,15 @@ def auto_check_and_redirect() -> bool:
 
     loaded_as_is = 0
     for entry in ref_entries:
-        if entry.exists and redirect_reference(entry.ref_node, Path(entry.ref_path)):
+        # Deliberately set_reference_loaded (no path arg), not redirect_reference:
+        # passing the unchanged ref_path through cmds.file(path, loadReference=...)
+        # takes Maya's repath-and-reload code path, which on a node that was never
+        # loaded (deferred open) can mark it loaded without actually pulling its
+        # nodes into the DAG/viewport — the artist then has to hit Reload by hand.
+        # cmds.file(loadReference=node) with no path is the plain "load" path (the
+        # same one Load All References/the per-row checkbox already use) and does
+        # not have that problem.
+        if entry.exists and set_reference_loaded(entry.ref_node, True):
             loaded_as_is += 1
     if loaded_as_is:
         print(f"{_LOG_PREFIX} auto_check_and_redirect: loaded {loaded_as_is} reference(s) as-is.")

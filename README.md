@@ -228,6 +228,16 @@ see
 `core.py`'s `auto_check_and_redirect` (the same `kAfterOpen` callback as
 always) then does the loading itself: redirects broken ones per the rules
 above, and explicitly (re)loads every reference that's already fine as-is
+via `set_reference_loaded(ref_node, True)` — deliberately **not**
+`redirect_reference(ref_node, Path(ref_path))` even though the path is
+unchanged: passing that unchanged path through `cmds.file(path,
+loadReference=...)` takes Maya's repath-and-reload code path, which on a
+node that was never loaded (this deferred-open case) can mark the node
+loaded internally without actually pulling its nodes into the DAG/viewport
+— the artist then had to hit Reload by hand to see it (a real bug fixed
+2026-08-14). `cmds.file(loadReference=node)` with no path — what
+`set_reference_loaded` calls, same as the per-row checkbox/Load All
+References use — is the plain "load" path and doesn't have that problem
 (a no-op after a normal load, load-bearing after a deferred one — see that
 function's own docstring). This only covers scenes launched through
 MayaLauncher — a manual File > Open later in the same session still goes
