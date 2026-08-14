@@ -29,6 +29,7 @@ confirm-before-updating behavior."""
 
 from __future__ import annotations
 
+import functools
 import os
 import traceback
 from dataclasses import dataclass
@@ -338,6 +339,22 @@ def set_reference_loaded(ref_node: str | None, loaded: bool) -> bool:
         return False
 
 
+def _deferred_load(fn, *args) -> None:
+    """Schedules a reference-loading call (set_reference_loaded/
+    redirect_reference) to run via cmds.evalDeferred instead of inline.
+    `auto_check_and_redirect` runs synchronously inside Maya's kAfterOpen
+    MSceneMessage callback — that C++ callback context is still mid file-open
+    transaction, and a cmds.file(loadReference=...) issued from inside it can
+    come back isLoaded=True without the reference's nodes actually being
+    instantiated into the DAG/viewport yet, leaving the scene looking empty
+    until the artist manually hits Reload. Running the exact same call a
+    moment later, after evalDeferred lets Maya finish unwinding the open
+    transaction and reach its own idle point, does not have that problem —
+    same call, just outside the callback's stack frame (fixed 2026-08-14,
+    see this plugin's own README "Beating Maya's own native..." section)."""
+    cmds.evalDeferred(functools.partial(fn, *args))
+
+
 def redirect_reference(ref_node: str | None, new_path: Path) -> bool:
     """Loads `new_path` into an already-referenced node — same
     `loadReference` call shape UkoreMaya.core.function.update_references()
@@ -509,7 +526,13 @@ def auto_check_and_redirect() -> bool:
     gets a chance to fire before this function has a chance to redirect the
     broken ones first. Without this step, a scene opened that way would
     come up with even its perfectly valid references sitting unloaded
-    forever.
+    forever. Every actual cmds.file(loadReference=...) call this function
+    makes — both this as-is reload and every redirect below — goes through
+    _deferred_load rather than running inline, since this whole function
+    executes synchronously inside Maya's kAfterOpen callback and a
+    loadReference issued from there can silently fail to instantiate its
+    nodes into the DAG/viewport until the artist manually hits Reload; see
+    _deferred_load's own docstring.
 
     Returns whether the caller should pop the full Ukore Reference Editor
     UI open afterward — True when the scene has any reference at all
@@ -539,11 +562,13 @@ def auto_check_and_redirect() -> bool:
         # nodes into the DAG/viewport — the artist then has to hit Reload by hand.
         # cmds.file(loadReference=node) with no path is the plain "load" path (the
         # same one Load All References/the per-row checkbox already use) and does
-        # not have that problem.
-        if entry.exists and set_reference_loaded(entry.ref_node, True):
+        # not have that problem. Still scheduled via _deferred_load, not called
+        # inline — see that function's own docstring for why.
+        if entry.exists and entry.ref_node:
+            _deferred_load(set_reference_loaded, entry.ref_node, True)
             loaded_as_is += 1
     if loaded_as_is:
-        print(f"{_LOG_PREFIX} auto_check_and_redirect: loaded {loaded_as_is} reference(s) as-is.")
+        print(f"{_LOG_PREFIX} auto_check_and_redirect: scheduled {loaded_as_is} reference(s) to load as-is.")
 
     missing_refs = [e for e in ref_entries if e.status == "missing"]
     missing_textures = [e for e in texture_entries if e.status == "missing"]
@@ -553,7 +578,7 @@ def auto_check_and_redirect() -> bool:
 
     texture_fixed = 0
     for entry in ref_auto:
-        redirect_reference(entry.ref_node, entry.suggested_path)
+        _deferred_load(redirect_reference, entry.ref_node, entry.suggested_path)
     for entry in texture_auto:
         if redirect_texture(entry.node_name, entry.attr_name, entry.suggested_path):
             texture_fixed += 1
@@ -571,7 +596,7 @@ def auto_check_and_redirect() -> bool:
 
     for entry in ref_confirm:
         if _confirm_redirect(entry.ref_path, entry.suggested_path):
-            redirect_reference(entry.ref_node, entry.suggested_path)
+            _deferred_load(redirect_reference, entry.ref_node, entry.suggested_path)
     for entry in texture_confirm:
         if _confirm_redirect(entry.file_path, entry.suggested_path):
             if redirect_texture(entry.node_name, entry.attr_name, entry.suggested_path):

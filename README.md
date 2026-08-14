@@ -231,15 +231,27 @@ above, and explicitly (re)loads every reference that's already fine as-is
 via `set_reference_loaded(ref_node, True)` — deliberately **not**
 `redirect_reference(ref_node, Path(ref_path))` even though the path is
 unchanged: passing that unchanged path through `cmds.file(path,
-loadReference=...)` takes Maya's repath-and-reload code path, which on a
-node that was never loaded (this deferred-open case) can mark the node
-loaded internally without actually pulling its nodes into the DAG/viewport
-— the artist then had to hit Reload by hand to see it (a real bug fixed
-2026-08-14). `cmds.file(loadReference=node)` with no path — what
-`set_reference_loaded` calls, same as the per-row checkbox/Load All
-References use — is the plain "load" path and doesn't have that problem
-(a no-op after a normal load, load-bearing after a deferred one — see that
-function's own docstring). This only covers scenes launched through
+loadReference=...)` takes Maya's repath-and-reload code path instead of the
+plain "load" path (a no-op after a normal load, load-bearing after a
+deferred one — see that function's own docstring).
+
+That call-shape fix alone (2026-08-14, first pass) turned out **not** to be
+enough on its own — the artist still had to hit Reload by hand once. The
+actual root cause is timing, not call shape: `auto_check_and_redirect` runs
+synchronously inside Maya's `kAfterOpen` `MSceneMessage` callback, and
+*any* `cmds.file(loadReference=...)` issued from inside that callback's
+still-mid-transaction C++ stack frame — `set_reference_loaded`'s plain load
+included — can come back `isLoaded=True` without Maya having actually
+instantiated the reference's nodes into the DAG/viewport yet. The exact
+same call succeeds cleanly a moment later, once Maya has fully unwound the
+open transaction and reached its own idle point. Every
+`cmds.file(loadReference=...)` this function issues (the as-is reload and
+both redirect loops) is therefore scheduled via `core.py`'s `_deferred_load`
+(`cmds.evalDeferred(functools.partial(fn, *args))`) rather than called
+inline (2026-08-14, second pass — see `_deferred_load`'s own docstring).
+Texture redirects (`redirect_texture`, plain `setAttr`) stay synchronous —
+`setAttr` on `fileTextureName` has no DAG-instantiation step to race, so it
+was never part of this bug. This only covers scenes launched through
 MayaLauncher — a manual File > Open later in the same session still goes
 through Maya's own normal reference resolution and can still show Maya's
 native dialog for anything broken; `auto_check_and_redirect` still cleans
@@ -286,9 +298,14 @@ behavior existed.
   `_classify_path`), `_check_outdated` (version checking),
   `is_reference_loaded`/`set_reference_loaded` (load-state toggle),
   `redirect_reference`/`redirect_texture`/`update_reference_version`,
-  `auto_fix_entries` (the manual Rescan button's
-  own silent-safe-only auto-redirect, shared logic with the paragraph
-  below), and `auto_check_and_redirect` (the automatic entry point
+  `_deferred_load` (schedules a reference-loading call past the
+  `kAfterOpen` callback's own stack frame via `cmds.evalDeferred` — see
+  "Beating Maya's own native..." below for why), `auto_fix_entries` (the
+  manual Rescan button's own silent-safe-only auto-redirect, shared logic
+  with the paragraph below — synchronous, since Rescan runs from a normal
+  button click, not from inside `kAfterOpen`, so it doesn't need
+  `_deferred_load`), and `auto_check_and_redirect` (the automatic entry
+  point
   `ukoreMaya.py`'s `kAfterOpen` callback calls, applying the shared
   `_sort_for_auto_fix`/`_confirm_redirect` policy to both lists — missing
   entries only, never outdated ones).
