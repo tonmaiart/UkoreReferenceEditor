@@ -1,12 +1,13 @@
-"""Ukore Reference Editor's manual UI — a table of every broken/matched file
-in the scene with its Internal/External/Unmatched scope, split into two
-tabs ("Maya File" for references, "Textures" for file-texture nodes) since
-those need different redirect calls (loadReference vs. setAttr) but share
-the exact same scan/classify algorithm underneath. Not built on
-tmlib.ui.interface_template's ToolkitWindow, since that loads a Designer
-.ui file by toolkit name and this needs a dynamically populated table
-rather than a static form — just the same MayaQWidgetDockableMixin +
-Maya-window-parenting shape it uses underneath."""
+"""Ukore Reference Editor's UI — loads widget.ui (Qt Designer) and wires its
+tables/buttons/info panels to core.py's scan/redirect functions, split into
+two tabs ("Maya File" for references, "Textures" for file-texture nodes)
+since those need different redirect calls (loadReference vs. setAttr) but
+share the exact same scan/classify algorithm underneath. Not built on
+tmlib.ui.interface_template's ToolkitWindow (which expects a toolkit
+package with a ui.ui file discoverable by name via File.load_ui_external) —
+widget.ui is loaded directly via tmlib.core.File.load_ui instead, same
+MayaQWidgetDockableMixin + Maya-window-parenting shape ToolkitWindow uses
+underneath."""
 
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import maya.cmds as cmds
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
 from maya import OpenMayaUI
 from tmlib.module.PySide import QtCore, QtGui, QtWidgets, wrapInstance
+from tmlib.core import File
 from tmlib.ui import uitools
 
 from UkoreReferenceEditor import core, matcher
@@ -26,15 +28,34 @@ reload(matcher)
 reload(core)
 
 _LOG_PREFIX = "[UkoreReferenceEditor]"
+_UI_PATH = Path(__file__).resolve().parent / "widget.ui"
 
-_ICONS_DIR = Path(__file__).resolve().parent / "icons"
-_STATUS_ICON_FILENAMES = {
-    "ok": "icons8-check-mark-48.png",
-    "missing": "icons8-cancel-48.png",
-    "outdated": "icons8-update-48.png",
-}
 _STATUS_LABELS = {"ok": "OK", "missing": "Missing", "outdated": "Outdated"}
 _SCOPE_LABELS = {"internal": "Internal", "external": "External", "unmatched": "Unmatched"}
+
+_STATUS_ICON_PIXMAPS = {
+    "ok": QtWidgets.QStyle.SP_DialogApplyButton,
+    "missing": QtWidgets.QStyle.SP_DialogCancelButton,
+    "outdated": QtWidgets.QStyle.SP_BrowserReload,
+}
+_LOADED_ICON_PIXMAPS = {
+    True: QtWidgets.QStyle.SP_DialogYesButton,
+    False: QtWidgets.QStyle.SP_DialogNoButton,
+}
+
+_REF_COLUMNS = ["Loaded", "Status", "Reference Node", "File", "Version", "Next Version", "Scope"]
+(
+    _REF_COL_LOADED,
+    _REF_COL_STATUS,
+    _REF_COL_NODE,
+    _REF_COL_FILE,
+    _REF_COL_VERSION,
+    _REF_COL_NEXT_VERSION,
+    _REF_COL_SCOPE,
+) = range(len(_REF_COLUMNS))
+
+_TEX_COLUMNS = ["Status", "File", "Scope"]
+_TEX_COL_STATUS, _TEX_COL_FILE, _TEX_COL_SCOPE = range(len(_TEX_COLUMNS))
 
 
 def _get_maya_window():
@@ -42,311 +63,371 @@ def _get_maya_window():
     return wrapInstance(int(main_window_ptr), QtWidgets.QWidget)
 
 
+def _standard_icon(pixmap) -> QtGui.QIcon:
+    return QtWidgets.QApplication.instance().style().standardIcon(pixmap)
+
+
 def _status_icon(status: str) -> QtGui.QIcon:
-    filename = _STATUS_ICON_FILENAMES.get(status)
-    if not filename:
-        return QtGui.QIcon()
-    icon_path = _ICONS_DIR / filename
-    return QtGui.QIcon(str(icon_path)) if icon_path.is_file() else QtGui.QIcon()
+    return _standard_icon(_STATUS_ICON_PIXMAPS.get(status, QtWidgets.QStyle.SP_FileIcon))
 
 
-def _redirect_spec(entry):
-    """(button label, target path, action kind) for the row's Redirect
-    button, or None if there's nothing to redirect to. Update Version is a
-    separate, always-present button on the Maya File tab (see
-    _open_update_version_dialog) — not handled here."""
-    if getattr(entry, "status", None) == "missing" and entry.suggested_path is not None:
-        return "Redirect", entry.suggested_path, "redirect"
-    return None
+def _loaded_icon(is_loaded: bool) -> QtGui.QIcon:
+    return _standard_icon(_LOADED_ICON_PIXMAPS[bool(is_loaded)])
 
 
-class _EntryTable(QtWidgets.QWidget):
-    """One tab's contents — a toolbar (Rescan, plus Load All/Unload All
-    References on the Maya File tab), status line, and table. Only the
-    scan/redirect functions and column shape differ between the "Maya
-    File" tab (references — Loaded checkbox, Version column, Update
-    Version button) and the "Textures" tab (file-texture nodes — no load
-    state, no version concept); everything else (table population, error
-    handling, debug logging, the Repath flow) is identical, so it lives
-    here once instead of twice."""
+def _set_table_columns(
+    table: QtWidgets.QTableWidget, columns: list, stretch_column: str, wide_columns: dict | None = None
+):
+    wide_columns = wide_columns or {}
+    table.setColumnCount(len(columns))
+    table.setHorizontalHeaderLabels(columns)
+    table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+    table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+    header = table.horizontalHeader()
+    for index, name in enumerate(columns):
+        if name == stretch_column:
+            header.setSectionResizeMode(index, QtWidgets.QHeaderView.Stretch)
+        elif name in wide_columns:
+            # Interactive (not ResizeToContents) so the wider starting
+            # width actually sticks instead of immediately shrinking back
+            # to fit the cell text.
+            header.setSectionResizeMode(index, QtWidgets.QHeaderView.Interactive)
+            table.setColumnWidth(index, wide_columns[name])
+        else:
+            header.setSectionResizeMode(index, QtWidgets.QHeaderView.ResizeToContents)
 
-    def __init__(
-        self,
-        label: str,
-        scan_fn,
-        redirect_fn,
-        update_version_fn,
-        path_attr: str,
-        has_version_column: bool,
-        has_load_checkbox: bool = False,
-        has_find_all_button: bool = False,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self._label = label
-        self._scan_fn = scan_fn
-        self._redirect_fn = redirect_fn
-        self._update_version_fn = update_version_fn
-        self._path_attr = path_attr
-        self._has_version_column = has_version_column
-        self._has_load_checkbox = has_load_checkbox
+
+def _selected_rows(table: QtWidgets.QTableWidget) -> list[int]:
+    return sorted({index.row() for index in table.selectionModel().selectedRows()})
+
+
+class _ReferenceTab:
+    """Wires the "Maya File" tab's tableWidget_maya_reference_file, its
+    Load/Unload/Reload/Change Version/Search Folder.../Change Reference
+    File.../Auto Resolve buttons, and its Reference File Info line edits.
+    There's no dedicated "Rescan" button on this tab in widget.ui — Auto
+    Resolve doubles as it (scan + apply the safe-only auto-fix pass, same
+    as every other action's own post-action refresh, just with auto-fix
+    turned on); every other button only refreshes to reflect its own
+    action, without also silently auto-fixing unrelated rows."""
+
+    def __init__(self, ui):
+        self.table: QtWidgets.QTableWidget = ui.tableWidget_maya_reference_file
         self._entries: list = []
 
-        self._columns = []
-        if has_load_checkbox:
-            self._columns.append("Loaded")
-        self._columns.append("Status")
-        self._columns.append("File")
-        if has_version_column:
-            self._columns.append("Version")
-            self._columns.append("Next Version")
-        self._columns.append("Scope")
-        self._columns.append("Actions")
-        self._load_checkbox_col = 0 if has_load_checkbox else None
+        _set_table_columns(self.table, _REF_COLUMNS, stretch_column="File", wide_columns={"Reference Node": 220})
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
 
-        layout = QtWidgets.QVBoxLayout(self)
+        self._info_lines = (
+            ui.lineEdit_reference_node,
+            ui.lineEdit_absolute_reference_path,
+            ui.lineEdit_status_2,
+            ui.lineEdit_reference_repo_scope_2,
+            ui.lineEdit_current_version,
+            ui.lineEdit_lastest_version,
+        )
+        for line_edit in self._info_lines:
+            line_edit.setReadOnly(True)
+        self._clear_info_panel()
 
-        toolbar = QtWidgets.QHBoxLayout()
-        rescan_button = QtWidgets.QPushButton("Rescan")
-        rescan_button.clicked.connect(self.reload_table)
-        toolbar.addWidget(rescan_button)
+        self._load_button = ui.pushButton_load_selected_reference
+        self._unload_button = ui.pushButton_unload_selected_reference
+        self._update_action_buttons()
 
-        if has_load_checkbox:
-            load_all_button = QtWidgets.QPushButton("Load All References")
-            load_all_button.clicked.connect(self._load_all)
-            toolbar.addWidget(load_all_button)
+        ui.pushButton_load_selected_reference.clicked.connect(self._on_load)
+        ui.pushButton_unload_selected_reference.clicked.connect(self._on_unload)
+        ui.pushButton_reload_selected_reference.clicked.connect(self._on_reload)
+        ui.pushButton_change_version.clicked.connect(self._on_change_version)
+        ui.pushButton_search_by_folder.clicked.connect(self._on_search_folder)
+        ui.pushButton_change_reference_file.clicked.connect(self._on_change_reference_file)
+        ui.pushButton_auto_resolve.clicked.connect(self._on_auto_resolve)
 
-            unload_all_button = QtWidgets.QPushButton("Unload All References")
-            unload_all_button.clicked.connect(self._unload_all)
-            toolbar.addWidget(unload_all_button)
-
-        if has_find_all_button:
-            find_all_button = QtWidgets.QPushButton("Find All Missing File...")
-            find_all_button.clicked.connect(self._find_all_missing)
-            toolbar.addWidget(find_all_button)
-
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
-
-        self.status_label = QtWidgets.QLabel("")
-        layout.addWidget(self.status_label)
-
-        self.table = QtWidgets.QTableWidget(0, len(self._columns), self)
-        self.table.setHorizontalHeaderLabels(self._columns)
-        # Narrow columns (checkbox, icon/short-text Status, Version/Next
-        # Version, Scope, the button-holding Actions column) size to their
-        # own content instead of stretching — a uniform Stretch on every
-        # column left Status/Version eating far more width than an icon or
-        # "v021" ever needs, squeezing the File column that actually needs
-        # the room. Only File stretches, so the table still always fills
-        # the window exactly (no dead space, no horizontal scrollbar)
-        # without wasting space on the narrow ones. The File column itself
-        # only ever holds a filename now (see reload_table) — the full path
-        # lives in the File Info panel below instead, which is what saves
-        # the space in the first place.
-        header = self.table.horizontalHeader()
-        for index, column_name in enumerate(self._columns):
-            if column_name == "File":
-                header.setSectionResizeMode(index, QtWidgets.QHeaderView.Stretch)
-            else:
-                header.setSectionResizeMode(index, QtWidgets.QHeaderView.ResizeToContents)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        if has_load_checkbox:
-            self.table.itemChanged.connect(self._on_item_changed)
-        self.table.itemSelectionChanged.connect(self._update_file_info)
-        layout.addWidget(self.table)
-
-        info_group = QtWidgets.QGroupBox("File Info")
-        info_layout = QtWidgets.QFormLayout(info_group)
-
-        def _selectable_label() -> QtWidgets.QLabel:
-            info_label = QtWidgets.QLabel("")
-            info_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse | QtCore.Qt.TextSelectableByKeyboard)
-            info_label.setWordWrap(True)
-            return info_label
-
-        self.info_path_label = _selectable_label()
-        info_layout.addRow("Full Reference Path:", self.info_path_label)
-
-        self.info_status_label = _selectable_label()
-        info_layout.addRow("Status:", self.info_status_label)
-
-        self.info_scope_label = _selectable_label()
-        info_layout.addRow("Scope:", self.info_scope_label)
-
-        self.info_repo_label = _selectable_label()
-        info_layout.addRow("Matched Repo:", self.info_repo_label)
-
-        self.info_version_label = None
-        if has_version_column:
-            self.info_version_label = _selectable_label()
-            info_layout.addRow("Version -> Next Version:", self.info_version_label)
-
-        self.info_node_label = _selectable_label()
-        info_layout.addRow("Reference Node:" if has_load_checkbox else "Node.Attribute:", self.info_node_label)
-
-        layout.addWidget(info_group)
-        self._clear_file_info()
-
-    def reload_table(self):
-        print(f"{_LOG_PREFIX} [{self._label}] Rescan clicked — scanning...")
+    def reload_table(self, run_auto_fix: bool = True):
+        print(f"{_LOG_PREFIX} [Maya File] scanning...")
         try:
-            entries = self._scan_fn()
-            # Auto-apply anything safe to auto-apply (see
-            # core.auto_fix_entries's own docstring for exactly what
-            # "safe" means here) right away, then rescan once more so the
-            # table reflects the real post-fix state instead of a stale
-            # "missing" row for something that's already been redirected.
-            fixed = core.auto_fix_entries(entries, self._redirect_fn)
-            if fixed:
-                print(f"{_LOG_PREFIX} [{self._label}] auto-fixed {fixed} entrie(s), rescanning...")
-                entries = self._scan_fn()
+            entries = core.scan_references()
+            if run_auto_fix:
+                fixed = core.auto_fix_entries(entries, self._redirect)
+                if fixed:
+                    print(f"{_LOG_PREFIX} [Maya File] auto-fixed {fixed} entrie(s), rescanning...")
+                    entries = core.scan_references()
             self._entries = entries
         except Exception as exc:
             traceback.print_exc()
-            message = f"Rescan failed: {exc}"
-            print(f"{_LOG_PREFIX} [{self._label}] {message}")
-            cmds.warning(f"{_LOG_PREFIX} [{self._label}] {message}")
-            self.status_label.setText(message)
+            cmds.warning(f"{_LOG_PREFIX} [Maya File] Rescan failed: {exc}")
             self.table.setRowCount(0)
             return
 
-        print(f"{_LOG_PREFIX} [{self._label}] scan returned {len(self._entries)} entrie(s):")
-        for entry in self._entries:
-            path = getattr(entry, self._path_attr)
-            print(f"{_LOG_PREFIX}   path={path!r} status={entry.status} scope={entry.scope}")
-
-        # setItem() below would otherwise fire itemChanged for every cell
-        # (not just the checkbox column) while the table repopulates,
-        # racing _on_item_changed against Maya calls for rows that haven't
-        # even been fully built yet.
         self.table.blockSignals(True)
         try:
             self.table.setRowCount(len(self._entries))
-
             for row, entry in enumerate(self._entries):
-                col = 0
-
-                if self._has_load_checkbox:
-                    loaded_item = QtWidgets.QTableWidgetItem()
-                    loaded_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
-                    loaded_item.setCheckState(
-                        QtCore.Qt.Checked if getattr(entry, "is_loaded", False) else QtCore.Qt.Unchecked
-                    )
-                    self.table.setItem(row, col, loaded_item)
-                    col += 1
+                loaded_item = QtWidgets.QTableWidgetItem("Loaded" if entry.is_loaded else "Unloaded")
+                loaded_item.setIcon(_loaded_icon(entry.is_loaded))
+                self.table.setItem(row, _REF_COL_LOADED, loaded_item)
 
                 status_item = QtWidgets.QTableWidgetItem(_STATUS_LABELS.get(entry.status, entry.status))
                 status_item.setIcon(_status_icon(entry.status))
-                self.table.setItem(row, col, status_item)
-                col += 1
+                self.table.setItem(row, _REF_COL_STATUS, status_item)
 
-                full_path = getattr(entry, self._path_attr)
-                filename_item = QtWidgets.QTableWidgetItem(Path(full_path).name if full_path else "")
-                filename_item.setToolTip(full_path)
-                self.table.setItem(row, col, filename_item)
-                col += 1
+                self.table.setItem(row, _REF_COL_NODE, QtWidgets.QTableWidgetItem(entry.ref_node or ""))
 
-                if self._has_version_column:
-                    self.table.setItem(row, col, QtWidgets.QTableWidgetItem(getattr(entry, "version", None) or ""))
-                    col += 1
-                    self.table.setItem(
-                        row, col, QtWidgets.QTableWidgetItem(getattr(entry, "next_version", None) or "")
-                    )
-                    col += 1
+                filename_item = QtWidgets.QTableWidgetItem(Path(entry.ref_path).name if entry.ref_path else "")
+                filename_item.setToolTip(entry.ref_path or "")
+                self.table.setItem(row, _REF_COL_FILE, filename_item)
 
-                self.table.setItem(row, col, QtWidgets.QTableWidgetItem(_SCOPE_LABELS[entry.scope]))
-                col += 1
-
-                self.table.setCellWidget(row, col, self._build_actions_widget(row, entry))
+                self.table.setItem(row, _REF_COL_VERSION, QtWidgets.QTableWidgetItem(entry.version or ""))
+                self.table.setItem(
+                    row, _REF_COL_NEXT_VERSION, QtWidgets.QTableWidgetItem(entry.next_version or "")
+                )
+                self.table.setItem(row, _REF_COL_SCOPE, QtWidgets.QTableWidgetItem(_SCOPE_LABELS[entry.scope]))
         finally:
             self.table.blockSignals(False)
 
-        missing_count = sum(1 for e in self._entries if e.status == "missing")
-        outdated_count = sum(1 for e in self._entries if e.status == "outdated")
-        self.status_label.setText(
-            f"{len(self._entries)} entrie(s) — {missing_count} missing, {outdated_count} outdated. "
-            "See Script Editor for details."
-        )
-
         # Repopulating the table drops whatever selection existed before —
-        # the File Info panel would otherwise keep showing a stale row.
-        self._clear_file_info()
+        # refreshes both the info panel and the Load/Unload enabled state
+        # back to their "nothing selected" defaults.
+        self._on_selection_changed()
 
-    def _clear_file_info(self):
-        self.info_path_label.setText("")
-        self.info_status_label.setText("")
-        self.info_scope_label.setText("")
-        self.info_repo_label.setText("")
-        if self.info_version_label is not None:
-            self.info_version_label.setText("")
-        self.info_node_label.setText("")
+    @staticmethod
+    def _redirect(entry, new_path) -> bool:
+        return core.redirect_reference(entry.ref_node, new_path)
 
-    def _update_file_info(self):
-        row = self.table.currentRow()
-        if row < 0 or row >= len(self._entries):
-            self._clear_file_info()
+    def _selected_entries(self) -> list:
+        rows = _selected_rows(self.table)
+        return [self._entries[row] for row in rows if row < len(self._entries)]
+
+    def _clear_info_panel(self):
+        for line_edit in self._info_lines:
+            line_edit.setText("")
+
+    def _on_selection_changed(self):
+        self._update_info_panel()
+        self._update_action_buttons()
+
+    def _update_action_buttons(self):
+        """Load is only useful while something selected is still unloaded;
+        Unload is only useful while something selected is still loaded —
+        both disabled outright with no selection at all."""
+        entries = self._selected_entries()
+        self._load_button.setEnabled(any(not entry.is_loaded for entry in entries))
+        self._unload_button.setEnabled(any(entry.is_loaded for entry in entries))
+
+    def _update_info_panel(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            self._clear_info_panel()
             return
+        entry = self._entries[rows[0]]
+        node, path, status, scope, version, next_version = self._info_lines
+        node.setText(entry.ref_node or "")
+        path.setText(entry.ref_path or "")
+        status.setText(_STATUS_LABELS.get(entry.status, entry.status))
+        scope.setText(_SCOPE_LABELS[entry.scope])
+        version.setText(entry.version or "")
+        next_version.setText(entry.next_version or "")
 
-        entry = self._entries[row]
-        full_path = getattr(entry, self._path_attr)
-        self.info_path_label.setText(full_path or "")
-        self.info_status_label.setText(_STATUS_LABELS.get(entry.status, entry.status))
-        self.info_scope_label.setText(_SCOPE_LABELS[entry.scope])
-
-        matched_repo = getattr(entry, "matched_repo", None)
-        self.info_repo_label.setText(matched_repo.name if matched_repo else "")
-
-        if self.info_version_label is not None:
-            version = getattr(entry, "version", None) or "-"
-            next_version = getattr(entry, "next_version", None)
-            self.info_version_label.setText(f"{version} -> {next_version}" if next_version else version)
-
-        if self._has_load_checkbox:
-            self.info_node_label.setText(getattr(entry, "ref_node", None) or "")
-        else:
-            self.info_node_label.setText(f"{entry.node_name}.{entry.attr_name}")
-
-    def _on_item_changed(self, item: QtWidgets.QTableWidgetItem):
-        if self._load_checkbox_col is None or item.column() != self._load_checkbox_col:
+    def _on_load(self):
+        entries = self._selected_entries()
+        if not entries:
+            cmds.warning(f"{_LOG_PREFIX} [Maya File] Load: no reference selected.")
             return
-        row = item.row()
-        if row >= len(self._entries):
-            return
-        entry = self._entries[row]
-        loaded = item.checkState() == QtCore.Qt.Checked
-        action = "Load" if loaded else "Unload"
-        print(f"{_LOG_PREFIX} [{self._label}] {action}: {getattr(entry, self._path_attr)!r}")
-        ok = core.set_reference_loaded(entry.ref_node, loaded)
-        print(f"{_LOG_PREFIX} [{self._label}] {action} returned {ok}")
-        entry.is_loaded = loaded if ok else entry.is_loaded
-
-    def _load_all(self):
-        print(f"{_LOG_PREFIX} [{self._label}] Load All References clicked")
-        for entry in self._entries:
+        for entry in entries:
             core.set_reference_loaded(entry.ref_node, True)
-        self.reload_table()
+        self.reload_table(run_auto_fix=False)
 
-    def _unload_all(self):
-        print(f"{_LOG_PREFIX} [{self._label}] Unload All References clicked")
-        for entry in self._entries:
+    def _on_unload(self):
+        entries = self._selected_entries()
+        if not entries:
+            cmds.warning(f"{_LOG_PREFIX} [Maya File] Unload: no reference selected.")
+            return
+        for entry in entries:
             core.set_reference_loaded(entry.ref_node, False)
-        self.reload_table()
+        self.reload_table(run_auto_fix=False)
 
-    def _find_all_missing(self):
+    def _on_reload(self):
+        entries = self._selected_entries()
+        if not entries:
+            cmds.warning(f"{_LOG_PREFIX} [Maya File] Reload: no reference selected.")
+            return
+        for entry in entries:
+            # loadReference always re-reads from disk even when the
+            # reference is already loaded, so this forces a refresh rather
+            # than just changing load state (unlike Load/Unload).
+            core.set_reference_loaded(entry.ref_node, True)
+        self.reload_table(run_auto_fix=False)
+
+    def _on_change_version(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            cmds.warning(f"{_LOG_PREFIX} [Maya File] Change Version: select exactly one reference.")
+            return
+        entry = self._entries[rows[0]]
+        versions = matcher.list_available_versions(entry.ref_path)
+        if not versions:
+            cmds.warning(f"{_LOG_PREFIX} [Maya File] No published versions found for {entry.ref_path!r}")
+            return
+
+        dialog = QtWidgets.QDialog(self.table)
+        dialog.setWindowTitle("Change Version")
+        dialog_layout = QtWidgets.QVBoxLayout(dialog)
+        dialog_layout.addWidget(QtWidgets.QLabel(f"Current: {entry.ref_path}"))
+
+        combo = QtWidgets.QComboBox(dialog)
+        for version_label, version_path in versions:
+            suffix = " (latest)" if version_path == versions[0][1] else ""
+            combo.addItem(f"{version_label}{suffix}  —  {version_path.name}", str(version_path))
+        dialog_layout.addWidget(combo)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, parent=dialog
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        chosen_path = Path(combo.currentData())
+        ok = core.update_reference_version(entry.ref_node, chosen_path)
+        print(f"{_LOG_PREFIX} [Maya File] Change Version: {entry.ref_path!r} -> {chosen_path!r} returned {ok}")
+        self.reload_table(run_auto_fix=False)
+
+    def _on_search_folder(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            cmds.warning(f"{_LOG_PREFIX} [Maya File] Search Folder...: select exactly one reference.")
+            return
+        self._repath(self._entries[rows[0]], file_mode=3, caption="Search Folder...")
+
+    def _on_change_reference_file(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            cmds.warning(f"{_LOG_PREFIX} [Maya File] Change Reference File...: select exactly one reference.")
+            return
+        self._repath(self._entries[rows[0]], file_mode=1, caption="Change Reference File...")
+
+    def _repath(self, entry, file_mode: int, caption: str):
+        starting_dir = ""
+        if entry.ref_path:
+            parent = Path(entry.ref_path).parent
+            if parent.is_dir():
+                starting_dir = str(parent)
+
+        chosen = cmds.fileDialog2(
+            fileMode=file_mode,
+            dialogStyle=2,
+            caption=caption,
+            okCaption="Select" if file_mode == 1 else "Search",
+            startingDirectory=starting_dir,
+        )
+        if not chosen:
+            return
+
+        resolved = matcher.resolve_manual_target(entry.ref_path, Path(chosen[0]))
+        if resolved is None:
+            cmds.warning(
+                f"{_LOG_PREFIX} [Maya File] {caption}: no file named "
+                f"{Path(entry.ref_path).name!r} found under {chosen[0]}"
+            )
+            return
+
+        ok = core.redirect_reference(entry.ref_node, resolved)
+        print(f"{_LOG_PREFIX} [Maya File] {caption}: {entry.ref_path!r} -> {resolved!r} returned {ok}")
+        self.reload_table(run_auto_fix=False)
+
+    def _on_auto_resolve(self):
+        self.reload_table(run_auto_fix=True)
+
+
+class _TextureTab:
+    """Wires the "Textures" tab's tableWidget_textures, its Rescan / Find
+    All Missing File... buttons, and its Texture File Info line edits."""
+
+    def __init__(self, ui):
+        self.table: QtWidgets.QTableWidget = ui.tableWidget_textures
+        self._entries: list = []
+
+        _set_table_columns(self.table, _TEX_COLUMNS, stretch_column="File")
+        self.table.itemSelectionChanged.connect(self._update_info_panel)
+
+        self._info_lines = (
+            ui.lineEdit_absolute_texture_path,
+            ui.lineEdit_status,
+            ui.lineEdit_reference_repo_scope,
+        )
+        for line_edit in self._info_lines:
+            line_edit.setReadOnly(True)
+        self._clear_info_panel()
+
+        ui.pushButton_rescan_texture.clicked.connect(self.reload_table)
+        ui.pushButton_find_all_missing_texture.clicked.connect(self._on_find_all_missing)
+
+    def reload_table(self):
+        print(f"{_LOG_PREFIX} [Textures] scanning...")
+        try:
+            entries = core.scan_textures()
+            fixed = core.auto_fix_entries(entries, self._redirect)
+            if fixed:
+                print(f"{_LOG_PREFIX} [Textures] auto-fixed {fixed} entrie(s), rescanning...")
+                entries = core.scan_textures()
+            self._entries = entries
+        except Exception as exc:
+            traceback.print_exc()
+            cmds.warning(f"{_LOG_PREFIX} [Textures] Rescan failed: {exc}")
+            self.table.setRowCount(0)
+            return
+
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self._entries))
+            for row, entry in enumerate(self._entries):
+                status_item = QtWidgets.QTableWidgetItem(_STATUS_LABELS.get(entry.status, entry.status))
+                status_item.setIcon(_status_icon(entry.status))
+                self.table.setItem(row, _TEX_COL_STATUS, status_item)
+
+                filename_item = QtWidgets.QTableWidgetItem(Path(entry.file_path).name if entry.file_path else "")
+                filename_item.setToolTip(entry.file_path or "")
+                self.table.setItem(row, _TEX_COL_FILE, filename_item)
+
+                self.table.setItem(row, _TEX_COL_SCOPE, QtWidgets.QTableWidgetItem(_SCOPE_LABELS[entry.scope]))
+        finally:
+            self.table.blockSignals(False)
+
+        self._clear_info_panel()
+
+    @staticmethod
+    def _redirect(entry, new_path) -> bool:
+        return core.redirect_texture(entry.node_name, entry.attr_name, new_path)
+
+    def _clear_info_panel(self):
+        for line_edit in self._info_lines:
+            line_edit.setText("")
+
+    def _update_info_panel(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            self._clear_info_panel()
+            return
+        entry = self._entries[rows[0]]
+        path, status, scope = self._info_lines
+        path.setText(entry.file_path or "")
+        status.setText(_STATUS_LABELS.get(entry.status, entry.status))
+        scope.setText(_SCOPE_LABELS[entry.scope])
+
+    def _on_find_all_missing(self):
         missing_entries = [e for e in self._entries if e.status == "missing"]
         if not missing_entries:
-            message = "No missing files to search for."
-            print(f"{_LOG_PREFIX} [{self._label}] Find All Missing File: {message}")
-            cmds.warning(f"{_LOG_PREFIX} [{self._label}] {message}")
+            cmds.warning(f"{_LOG_PREFIX} [Textures] Find All Missing File: no missing files to search for.")
             return
 
         # fileMode=3 is Maya's "existing directory only" mode — this button
-        # is specifically "search one folder for everything missing", not
-        # the single-file-or-folder choice Repath offers per row.
+        # is specifically "search one folder for everything missing", not a
+        # per-row choice.
         chosen = cmds.fileDialog2(
             fileMode=3,
+            dialogStyle=2,
             caption="Find All Missing File — Select Folder to Search",
             okCaption="Search",
         )
@@ -354,27 +435,21 @@ class _EntryTable(QtWidgets.QWidget):
             return
         search_root = Path(chosen[0])
 
-        print(
-            f"{_LOG_PREFIX} [{self._label}] Find All Missing File: searching {search_root} "
-            f"for {len(missing_entries)} missing file(s)..."
-        )
         results = []
         for entry in missing_entries:
-            current_path = getattr(entry, self._path_attr)
-            resolved = matcher.resolve_manual_target(current_path, search_root)
-            print(f"{_LOG_PREFIX}   {current_path!r} -> {resolved}")
+            resolved = matcher.resolve_manual_target(entry.file_path, search_root)
             results.append((entry, resolved))
 
         self._show_find_all_report(results)
 
     def _show_find_all_report(self, results: list):
         """`results` is [(entry, resolved_path_or_None), ...] — reports
-        every match/non-match from _find_all_missing and only actually
+        every match/non-match from _on_find_all_missing and only actually
         applies anything once the artist reviews the list and clicks
         Confirm Update; Cancel (or closing the dialog) discards all of it."""
         found_count = sum(1 for _entry, resolved in results if resolved is not None)
 
-        dialog = QtWidgets.QDialog(self)
+        dialog = QtWidgets.QDialog(self.table)
         dialog.setWindowTitle("Find All Missing File — Results")
         dialog.resize(700, 400)
         dialog_layout = QtWidgets.QVBoxLayout(dialog)
@@ -402,8 +477,9 @@ class _EntryTable(QtWidgets.QWidget):
             report_table.setItem(row, 0, check_item)
             check_items.append(check_item)
 
-            current_path = getattr(entry, self._path_attr)
-            report_table.setItem(row, 1, QtWidgets.QTableWidgetItem(Path(current_path).name if current_path else ""))
+            report_table.setItem(
+                row, 1, QtWidgets.QTableWidgetItem(Path(entry.file_path).name if entry.file_path else "")
+            )
             report_table.setItem(row, 2, QtWidgets.QTableWidgetItem(str(resolved) if resolved else "Not found"))
 
         dialog_layout.addWidget(report_table)
@@ -416,142 +492,19 @@ class _EntryTable(QtWidgets.QWidget):
         dialog_layout.addWidget(buttons)
 
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
-            print(f"{_LOG_PREFIX} [{self._label}] Find All Missing File: cancelled, nothing applied.")
+            print(f"{_LOG_PREFIX} [Textures] Find All Missing File: cancelled, nothing applied.")
             return
 
         applied = 0
         for row, (entry, resolved) in enumerate(results):
             if resolved is None or check_items[row].checkState() != QtCore.Qt.Checked:
                 continue
-            if self._redirect_fn(entry, resolved):
+            if self._redirect(entry, resolved):
                 applied += 1
 
-        print(f"{_LOG_PREFIX} [{self._label}] Find All Missing File: applied {applied} update(s).")
+        print(f"{_LOG_PREFIX} [Textures] Find All Missing File: applied {applied} update(s).")
         if applied:
             self.reload_table()
-
-    def _build_actions_widget(self, row: int, entry) -> QtWidgets.QWidget:
-        container = QtWidgets.QWidget()
-        row_layout = QtWidgets.QHBoxLayout(container)
-        row_layout.setContentsMargins(2, 0, 2, 0)
-
-        spec = _redirect_spec(entry)
-        if spec is not None:
-            label, target, kind = spec
-            redirect_button = QtWidgets.QPushButton(label)
-            redirect_button.clicked.connect(
-                lambda _checked=False, r=row, t=target, k=kind: self._run_action(r, t, k)
-            )
-            row_layout.addWidget(redirect_button)
-
-        if self._has_version_column:
-            update_button = QtWidgets.QPushButton("Update Version...")
-            update_button.clicked.connect(lambda _checked=False, r=row: self._open_update_version_dialog(r))
-            row_layout.addWidget(update_button)
-
-        repath_file_button = QtWidgets.QPushButton("Repath File...")
-        repath_file_button.clicked.connect(
-            lambda _checked=False, r=row: self._repath_row(r, file_mode=1, caption="Repath File...")
-        )
-        row_layout.addWidget(repath_file_button)
-
-        repath_search_button = QtWidgets.QPushButton("Repath Search...")
-        repath_search_button.clicked.connect(
-            lambda _checked=False, r=row: self._repath_row(r, file_mode=3, caption="Repath Search...")
-        )
-        row_layout.addWidget(repath_search_button)
-
-        return container
-
-    def _run_action(self, row: int, target_path: Path, kind: str):
-        entry = self._entries[row]
-        path = getattr(entry, self._path_attr)
-        fn = self._update_version_fn if kind == "update_version" else self._redirect_fn
-        print(f"{_LOG_PREFIX} [{self._label}] {kind}: {path!r} -> {target_path!r}")
-        ok = fn(entry, target_path)
-        print(f"{_LOG_PREFIX} [{self._label}] {kind} returned {ok}")
-        self.reload_table()
-
-    def _open_update_version_dialog(self, row: int):
-        entry = self._entries[row]
-        current_path = getattr(entry, self._path_attr)
-        versions = matcher.list_available_versions(current_path)
-        if not versions:
-            message = f"No published versions found for {current_path!r}"
-            print(f"{_LOG_PREFIX} [{self._label}] Update Version: {message}")
-            cmds.warning(f"{_LOG_PREFIX} [{self._label}] {message}")
-            return
-
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Update Version")
-        dialog_layout = QtWidgets.QVBoxLayout(dialog)
-        dialog_layout.addWidget(QtWidgets.QLabel(f"Current: {current_path}"))
-
-        combo = QtWidgets.QComboBox(dialog)
-        for version_label, version_path in versions:
-            suffix = " (latest)" if version_path == versions[0][1] else ""
-            combo.addItem(f"{version_label}{suffix}  —  {version_path.name}", str(version_path))
-        dialog_layout.addWidget(combo)
-
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, parent=dialog
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        dialog_layout.addWidget(buttons)
-
-        if dialog.exec_() != QtWidgets.QDialog.Accepted:
-            return
-
-        chosen_path = Path(combo.currentData())
-        self._run_action(row, chosen_path, "update_version")
-
-    def _repath_row(self, row: int, file_mode: int, caption: str):
-        """Backs both Repath buttons — `file_mode=1` ("Repath File...",
-        Maya's single-existing-file mode) is a direct override with the
-        chosen file; `file_mode=3` ("Repath Search...", Maya's
-        existing-directory-only mode, same as _find_all_missing's picker)
-        searches the chosen folder recursively for a file matching the
-        current path's own filename via matcher.resolve_manual_target. Two
-        dedicated buttons/fileModes instead of the old single ambiguous
-        fileMode=2 ("pick a file OR a folder") button — Maya's own docs
-        describe fileMode=2 as returning "the name of a directory" even
-        though files are displayed, which made a file pick silently behave
-        like a folder pick; see
-        developer/bug-history/2026-08-05-repath-filemode2-native-dialog-directory-only.md.
-        dialogStyle=2 forces Maya's own cross-platform dialog rather than
-        the OS-native one, the convention used everywhere else in this
-        codebase that calls fileDialog2."""
-        entry = self._entries[row]
-        current_path = getattr(entry, self._path_attr)
-        starting_dir = ""
-        if current_path:
-            parent = Path(current_path).parent
-            if parent.is_dir():
-                starting_dir = str(parent)
-
-        chosen = cmds.fileDialog2(
-            fileMode=file_mode,
-            dialogStyle=2,
-            caption=caption,
-            okCaption="Select" if file_mode == 1 else "Search",
-            startingDirectory=starting_dir,
-        )
-        if not chosen:
-            return
-
-        chosen_path = Path(chosen[0])
-        resolved = matcher.resolve_manual_target(current_path, chosen_path)
-        if resolved is None:
-            message = f"No file named {Path(current_path).name!r} found under {chosen_path}"
-            print(f"{_LOG_PREFIX} [{self._label}] {caption}: {message}")
-            cmds.warning(f"{_LOG_PREFIX} [{self._label}] {caption}: {message}")
-            return
-
-        print(f"{_LOG_PREFIX} [{self._label}] {caption}: {current_path!r} -> {resolved!r}")
-        ok = self._redirect_fn(entry, resolved)
-        print(f"{_LOG_PREFIX} [{self._label}] {caption} returned {ok}")
-        self.reload_table()
 
 
 class MainWindow(MayaQWidgetDockableMixin, QtWidgets.QMainWindow):
@@ -564,41 +517,24 @@ class MainWindow(MayaQWidgetDockableMixin, QtWidgets.QMainWindow):
         # File.launch("UkoreReferenceEditor") in this same Maya session)
         # otherwise survives after the window is closed, and re-showing a
         # second instance with the same objectName then raises "Object's
-        # name '...WorkspaceControl' is not unique." — same cleanup
-        # tmlib.ui.interface_template.ToolkitWindow does for every other
-        # tool window in this codebase, done here too since this window
-        # doesn't go through ToolkitWindow.
+        # name '...WorkspaceControl' is not unique."
         uitools.deleteControl(self.WINDOW_OBJECT)
 
         self.setWindowTitle("Ukore Reference Editor")
         self.setObjectName(self.WINDOW_OBJECT)
+
+        self.ui = File.load_ui(str(_UI_PATH))
+        self.setCentralWidget(self.ui)
         self.resize(1050, 640)
 
-        tabs = QtWidgets.QTabWidget(self)
+        self.ui.lineEdit_current_repo_name.setReadOnly(True)
+        self.ui.lineEdit_current_repo_path.setReadOnly(True)
+        repo_name, repo_path = core.get_active_repo_info()
+        self.ui.lineEdit_current_repo_name.setText(repo_name)
+        self.ui.lineEdit_current_repo_path.setText(repo_path)
 
-        self.reference_tab = _EntryTable(
-            label="Maya File",
-            scan_fn=core.scan_references,
-            redirect_fn=lambda entry, new_path: core.redirect_reference(entry.ref_node, new_path),
-            update_version_fn=lambda entry, new_path: core.update_reference_version(entry.ref_node, new_path),
-            path_attr="ref_path",
-            has_version_column=True,
-            has_load_checkbox=True,
-        )
-        self.texture_tab = _EntryTable(
-            label="Textures",
-            scan_fn=core.scan_textures,
-            redirect_fn=lambda entry, new_path: core.redirect_texture(entry.node_name, entry.attr_name, new_path),
-            update_version_fn=lambda entry, new_path: core.redirect_texture(entry.node_name, entry.attr_name, new_path),
-            path_attr="file_path",
-            has_version_column=False,
-            has_load_checkbox=False,
-            has_find_all_button=True,
-        )
-        tabs.addTab(self.reference_tab, "Maya File")
-        tabs.addTab(self.texture_tab, "Textures")
-
-        self.setCentralWidget(tabs)
+        self.reference_tab = _ReferenceTab(self.ui)
+        self.texture_tab = _TextureTab(self.ui)
 
         self.reference_tab.reload_table()
         self.texture_tab.reload_table()

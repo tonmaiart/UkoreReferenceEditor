@@ -298,6 +298,15 @@ def _build_texture_entry(node_name: str, active_repo, projects: list, root_ws: s
     )
 
 
+def get_active_repo_info() -> tuple[str, str]:
+    """(repo_name, repo_absolute_path) for the repo currently active/open in
+    Maya, or ("", "") if none is active — backs the manual UI's shared
+    "Current Repo Name"/"Current Repo Absolute Path" fields (outside either
+    tab, since the active repo is the same for both)."""
+    _active_project, active_repo, active_repo_path = repo_paths.get_active_repo()
+    return active_repo.name if active_repo else "", str(active_repo_path) if active_repo_path else ""
+
+
 def is_reference_loaded(ref_node: str | None) -> bool:
     """Whether `ref_node` is currently loaded — backs the Maya File tab's
     leading "Loaded" checkbox column. `cmds.referenceQuery(isLoaded=True)`
