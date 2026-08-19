@@ -663,6 +663,14 @@ class MainWindow(MayaQWidgetDockableMixin, QtWidgets.QMainWindow):
         self.texture_tab = _TextureTab(self.ui)
         self.audio_tab = _AudioTab(self.ui)
 
+        self.ui.pushButton_refresh_status.clicked.connect(self._on_refresh_all)
+
+        self.reference_tab.reload_table()
+        self.texture_tab.reload_table()
+        self.audio_tab.reload_table()
+
+    def _on_refresh_all(self):
+        print(f"{_LOG_PREFIX} Refresh Status: rescanning Maya File, Textures, and Audio...")
         self.reference_tab.reload_table()
         self.texture_tab.reload_table()
         self.audio_tab.reload_table()
