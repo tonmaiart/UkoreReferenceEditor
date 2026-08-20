@@ -473,9 +473,16 @@
        <item row="1" column="0">
         <layout class="QHBoxLayout" name="horizontalLayout_4">
          <item>
-          <widget class="QPushButton" name="pushButton_change_picker_path_auto_load_picker">
+          <widget class="QPushButton" name="pushButton_unload_picker">
            <property name="text">
-            <string>Auto Load Picker</string>
+            <string>Unload</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="pushButton_change_picker_path">
+           <property name="text">
+            <string>Change Path...</string>
            </property>
           </widget>
          </item>
@@ -493,20 +500,34 @@
           </spacer>
          </item>
          <item>
-          <widget class="QPushButton" name="pushButton_auto_resolve_picker_path">
+          <widget class="QPushButton" name="pushButton_change_picker_path_auto_load_picker">
            <property name="text">
-            <string>Auto Resolve</string>
+            <string>Auto Load Picker</string>
            </property>
           </widget>
          </item>
          <item>
-          <widget class="QPushButton" name="pushButton_change_picker_path">
+          <widget class="QPushButton" name="pushButton_auto_resolve_picker_path">
            <property name="text">
-            <string>Change Picker Path...</string>
+            <string>Auto Resolve Picker Path</string>
            </property>
           </widget>
          </item>
         </layout>
+       </item>
+       <item row="2" column="0">
+        <widget class="QLabel" name="label_picker_path">
+         <property name="text">
+          <string>TextLabel</string>
+         </property>
+        </widget>
+       </item>
+       <item row="3" column="0">
+        <widget class="QLabel" name="label_picker_image_source_path">
+         <property name="text">
+          <string>TextLabel</string>
+         </property>
+        </widget>
        </item>
       </layout>
      </widget>

@@ -318,17 +318,63 @@ the Custom Path, not recovered from a stale absolute path).
   a specific `Picker.json` directly (skipping the version dialog), which
   `picker.load_picker_for_character` then opens the same way Auto Load
   Picker's per-character step does.
+- **Unload** (`pushButton_unload_picker`) — Auto Load Picker's counterpart:
+  `picker.unload_all_pickers()` calls `dwpicker.close()` (not just
+  `_dwpicker.clear()`, which the per-character loop above uses to empty the
+  tabs before reloading) — dwpicker's own documented "close properly" entry
+  point, which also unregisters the picker's Maya callbacks. A no-op if no
+  picker window is currently open.
 
-**Resolving picker image source paths** — `fix_picker_image_paths(picker_path)`
-rewrites any shape's `image.path` entry that doesn't exist on disk (env
-vars expanded first, e.g. `$DWPICKER_PROJECT_DIRECTORY/...`) to a
-same-named file found via a recursive search under that Picker.json's own
-version folder — this runs automatically after every picker path
-resolution (both Auto Load Picker's per-character loop and Auto Resolve's
-proactive sweep), so `dwpicker`'s own blocking MissingImages dialog never
-fires for an image that simply moved with a publish. Returns whether it
+**Resolving picker image source paths** — `fix_picker_image_paths(picker_path,
+active_repo, projects, root_ws)` rewrites any shape's `image.path` entry
+that doesn't exist on disk (env vars expanded first, e.g.
+`$DWPICKER_PROJECT_DIRECTORY/...`), in two passes per missing image:
+
+1. A same-named file found via a recursive search under that Picker.json's
+   own version folder (`_find_image_in_dir`) — cheap, handles an image
+   simply moved/renamed within the same publish.
+2. Only if that misses: `_resolve_image_via_project_match` falls back to
+   the exact same `matcher.find_match_for_path`/`resolve_redirect`
+   project/repo path-matching algorithm "How a redirect is resolved" above
+   describes for Maya references/textures — a picker image was routinely
+   published under the studio's old absolute Google-Drive convention same
+   as any other asset, so a `bg_v4.png` no longer sitting in its own
+   version folder still gets found by matching the path's project/repo
+   segment and re-rooting (or recursively searching) from there. `active_repo`/
+   `projects`/`root_ws` come from `_repo_match_context()`, fetched once per
+   action (mirrors `core.py`'s `scan_references`/`scan_textures` fetching
+   this triple once per scan rather than per entry) — pass `projects=None`
+   to skip this second pass entirely.
+
+This runs automatically after every picker path resolution (Auto Load
+Picker's per-character loop, Auto Resolve's proactive sweep, and Change
+Picker Path...'s manual override), so `dwpicker`'s own blocking
+MissingImages dialog never fires for an image that simply moved with a
+publish or still points at the old Drive convention. Returns whether it
 actually rewrote anything, so Auto Resolve can report how many picker
 files it touched.
+
+**DWPICKER_PROJECT_DIRECTORY** — `picker.py`'s
+`_sync_dwpicker_project_directory_env` sets this env var (dwpicker's own
+built-in convention, see the vendored `ukore_dreamwall_picker` plugin's
+`dwpicker/path.py` — `format_path`/`expand_path`, for collapsing/expanding
+an `image.path` relative to a portable project root) to the active repo's
+root, every time `get_dreamwall_picker_dir`/`_repo_match_context` resolves
+it — i.e. on every picker action, not just once. Deliberately **not** a
+static `maya_launcher_env_bridge` contribution the way `PYTHONPATH` is
+contributed — `register(api)` only runs once at app startup (see
+`developer/app/docs/plugin-api.md`), so a value written there would freeze
+at whatever repo happened to be active then and go stale the moment the
+artist switches active repo without restarting UkoreHub. This helps any
+`image.path` that was published using dwpicker's own "auto-collapse path
+with environment variable" preference (`AUTO_COLLAPSE_IMG_PATH_FROM_ENV`)
+— it does **not** help an `image.path` stored as a plain absolute path
+that's genuinely missing on disk (`dwpicker`'s own MissingImages dialog
+shows the fully-expanded path either way, so a still-broken image after
+this can mean either the file is really gone, or it was published with a
+different `DWPICKER_PROJECT_DIRECTORY` root than the repo root assumed
+here — worth confirming against the raw, un-expanded `image.path` in the
+actual Picker.json if Auto Resolve/Auto Load Picker still can't clear it).
 
 The `tableWidget_dreamwall_picker` table has no separate "File Info" panel
 (unlike the other three tabs) — just Status/Character/File columns, File

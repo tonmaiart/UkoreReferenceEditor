@@ -1,7 +1,8 @@
 """Reference/texture scanning and redirect orchestration — the Maya-`cmds`
-layer. `interface.py` (manual UI) and `maya-plug-ins/ukoreMaya.py`'s
-automatic scene-open callback both call into this module rather than
-duplicating the scan/redirect logic.
+layer. `interface.py` (manual UI) and this module's own
+`register_scene_open_callback`/`_on_scene_opened` automatic scene-open
+callback both call into `auto_check_and_redirect` rather than duplicating
+the scan/redirect logic.
 
 Three independent kinds of broken path get the exact same
 matcher.find_match_for_path/resolve_redirect algorithm applied: Maya file
@@ -36,6 +37,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
+import maya.api.OpenMaya as om
 import maya.cmds as cmds
 
 from UkoreReferenceEditor import matcher, repo_paths
@@ -589,8 +591,19 @@ def _confirm_redirect(display_path: str, suggested_path: Path) -> bool:
 
 
 def auto_check_and_redirect() -> bool:
-    """The automatic entry point, called once per scene open (see
-    maya-plug-ins/ukoreMaya.py's kAfterOpen callback). Runs both
+    """The automatic entry point, called once per scene open — via this
+    module's own `register_scene_open_callback`/`_on_scene_opened`
+    kAfterOpen registration below, same independent-callback pattern
+    `picker.py`'s own `register_scene_open_callback` already uses for
+    Dreamwall Picker auto-load (Maya allows multiple independent callbacks
+    on the same MSceneMessage). This used to rely entirely on MayaToolkit's
+    own kAfterOpen dispatcher calling in — which only ever fired when the
+    scene was opened via UkoreHub's maya_launcher, never on a native Maya
+    File > Open, silently leaving every reference unresolved/unloaded on
+    that path (fixed 2026-08-20; MayaToolkit's dispatcher, wherever it
+    lives, may still also call this — the scan/redirect/reload logic below
+    is idempotent against a second call once everything already resolved,
+    just redundant work). Runs both
     scan_references and scan_textures through the same policy: internal
     matches and external matches already covered by one of the active
     repo's own Connect Input Path connections redirect immediately with a
@@ -624,9 +637,10 @@ def auto_check_and_redirect() -> bool:
     (regardless of status; an artist opening a referenced scene benefits
     from seeing the Maya File tab even if nothing is broken) or still has a
     missing texture once every safe/confirmed redirect above has already
-    been applied. `ukoreMaya.py`'s kAfterOpen callback is the only caller
-    and opens the UI on a True return via the same
-    `menu_utils.ukore_reference_editor()` the menu item itself uses."""
+    been applied. `_on_scene_opened` below is this module's own caller and
+    opens the UI on a True return via `tmlib.core.File.launch`, same as the
+    "Ukore Reference Editor..." menu item itself (see `__init__.py`'s
+    `register_menu`)."""
     ref_entries = scan_references()
     texture_entries = scan_textures()
     audio_entries = scan_audio()
@@ -650,7 +664,18 @@ def auto_check_and_redirect() -> bool:
         # same one Load All References/the per-row checkbox already use) and does
         # not have that problem. Still scheduled via _deferred_load, not called
         # inline — see that function's own docstring for why.
-        if entry.exists and entry.ref_node:
+        #
+        # `not entry.is_loaded` (added 2026-08-20): without this, a scene opened
+        # normally — where every valid reference is already loaded by the time
+        # this runs, per this function's own docstring — got every single one of
+        # them redundantly re-loaded from disk anyway. Harmless for most
+        # references, but a reference with a Dreamwall Picker already attached
+        # to its namespace (picker.py's own kAfterOpen callback queues its
+        # import right after this one) doesn't tolerate a same-session reload of
+        # nodes it's already holding onto — observed as picker Python errors
+        # ("invalid decimal literal") and, in one report, the reference's own
+        # content vanishing from the scene.
+        if entry.exists and entry.ref_node and not entry.is_loaded:
             _deferred_load(set_reference_loaded, entry.ref_node, True)
             loaded_as_is += 1
     if loaded_as_is:
@@ -702,3 +727,42 @@ def auto_check_and_redirect() -> bool:
     still_missing_textures = len(missing_textures) - texture_fixed
     still_missing_audio = len(missing_audio) - audio_fixed
     return bool(ref_entries) or still_missing_textures > 0 or still_missing_audio > 0
+
+
+def _on_scene_opened(*_args) -> None:
+    """kAfterOpen handler registered by `register_scene_open_callback`
+    below — runs `auto_check_and_redirect()` synchronously (that function's
+    own docstring already documents why it needs to run inline here rather
+    than via evalDeferred, unlike `picker.py`'s equivalent handler), then
+    opens the full Ukore Reference Editor UI on a True return, same
+    `tmlib.core.File.launch` call the "Ukore Reference Editor..." menu item
+    itself uses (see `__init__.py`'s `register_menu`)."""
+    try:
+        should_open_ui = auto_check_and_redirect()
+    except Exception:
+        print(f"{_LOG_PREFIX} auto_check_and_redirect: scene-open auto-fix failed:")
+        traceback.print_exc()
+        return
+
+    if should_open_ui:
+        from tmlib.core import File
+
+        File.launch("UkoreReferenceEditor")
+
+
+_scene_open_callback_id = None
+
+
+def register_scene_open_callback() -> None:
+    """Auto-runs the reference/texture/audio auto-fix on every scene open —
+    own independent kAfterOpen MSceneMessage callback, same pattern
+    `picker.py`'s own `register_scene_open_callback` already uses for
+    Dreamwall Picker auto-load (Maya allows multiple independent callbacks
+    on the same message). Must be called at import time (see `__init__.py`)
+    so it's already registered before the very first scene open of the Maya
+    session, same reasoning `picker.py`'s own docstring gives for its
+    callback."""
+    global _scene_open_callback_id
+    if _scene_open_callback_id is not None:
+        return
+    _scene_open_callback_id = om.MSceneMessage.addCallback(om.MSceneMessage.kAfterOpen, _on_scene_opened)

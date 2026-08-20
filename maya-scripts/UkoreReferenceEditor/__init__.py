@@ -1,6 +1,7 @@
 import maya.cmds as cmds
 
-from UkoreReferenceEditor.picker import register_scene_open_callback
+from UkoreReferenceEditor.core import register_scene_open_callback as _register_reference_scene_open_callback
+from UkoreReferenceEditor.picker import register_scene_open_callback as _register_picker_scene_open_callback
 
 # Registered at import time (mirrors the old standalone dw_publish_picker
 # plugin's own __init__.py) — must already be in place before the very
@@ -8,7 +9,12 @@ from UkoreReferenceEditor.picker import register_scene_open_callback
 # below, which needs UkoreMenu itself to be ready (see plugin.py's
 # pre_open_mel hook, which triggers this via a bare `import
 # UkoreReferenceEditor` before UkoreMenu is guaranteed available).
-register_scene_open_callback()
+# core's own callback (added 2026-08-20) makes the reference/texture/audio
+# auto-fix work on a native Maya File > Open too, not just when opened via
+# UkoreHub's maya_launcher — see core.py's register_scene_open_callback
+# docstring for why that was previously silently broken.
+_register_reference_scene_open_callback()
+_register_picker_scene_open_callback()
 
 
 def register_menu() -> None:

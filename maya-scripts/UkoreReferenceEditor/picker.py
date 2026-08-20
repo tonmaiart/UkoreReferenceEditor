@@ -8,10 +8,15 @@ the standalone plugin used, unchanged by the move. Backs the "Dreamwall
 Picker" tab in widget.ui (see interface.py's `_PickerTab`) and still
 self-registers its own kAfterOpen scene-open callback the same way the old
 plugin did, independent of `core.py`'s reference/texture/audio auto-fix
-flow — a Dreamwall Picker isn't a Maya reference or file-texture node, so it
-doesn't fit `matcher.find_match_for_path`/`resolve_redirect`'s project/repo
-path-matching algorithm; its own path resolution is Custom-Path-driven
-instead (see `get_dreamwall_picker_dir`)."""
+flow — a Dreamwall Picker isn't a Maya reference or file-texture node, so
+resolving *which* Picker.json to open is Custom-Path-driven (see
+`get_dreamwall_picker_dir`), not `matcher.find_match_for_path`/
+`resolve_redirect`'s project/repo path-matching. A picker's own embedded
+`image.path` entries are a different story, though — those were commonly
+published under the studio's old absolute Google-Drive convention same as
+any Maya reference/texture, so `fix_picker_image_paths` falls back to that
+exact same `matcher` algorithm (see its own docstring) once the cheaper
+same-version-folder search misses."""
 
 from __future__ import annotations
 
@@ -25,7 +30,7 @@ import maya.api.OpenMaya as om
 import maya.cmds as cmds
 from tmlib.module.PySide import QtWidgets
 
-from UkoreReferenceEditor import repo_paths
+from UkoreReferenceEditor import matcher, repo_paths
 
 _LOG_PREFIX = "[UkoreReferenceEditor] [Dreamwall Picker]"
 _VERSION_PATTERN = re.compile(r"^v(\d{3})$", re.IGNORECASE)
@@ -39,12 +44,66 @@ def get_maya_main_window() -> QtWidgets.QWidget | None:
     return None
 
 
+_DWPICKER_PROJECT_DIRECTORY_ENV = "DWPICKER_PROJECT_DIRECTORY"
+
+
+def _sync_dwpicker_project_directory_env(repo_path: Path) -> None:
+    """Sets dwpicker's own DWPICKER_PROJECT_DIRECTORY env var (see the
+    vendored `ukore_dreamwall_picker` plugin's `dwpicker/path.py` —
+    `format_path`/`expand_path`, its built-in convention for
+    collapsing/expanding an `image.path` relative to a portable project
+    root) to the currently active repo's root — the same rooting
+    convention (`workspace_root / repo.local_path`) this plugin already
+    uses everywhere else for redirecting an old absolute path onto the
+    current repo layout.
+
+    Deliberately set here at runtime, on every picker-directory
+    resolution, rather than as a static `maya_launcher_env_bridge`
+    contribution the way `PYTHONPATH` is contributed in `plugin.py`'s
+    `register(api)` — `register(api)` only runs once at app startup (see
+    `developer/app/docs/plugin-api.md`), so a value written there would
+    freeze at whatever repo happened to be active then and go stale the
+    moment the artist switches active repo without restarting UkoreHub."""
+    os.environ[_DWPICKER_PROJECT_DIRECTORY_ENV] = str(repo_path).replace("\\", "/")
+
+
+def get_picker_background_image_path(picker_path: Path) -> str:
+    """The resolved background image *file* path `picker_path`'s Picker.json
+    actually uses — not a folder. A character's picker has exactly one shape
+    flagged `"background": true` carrying the real artwork image
+    (`image.path`); every other shape is typically a plain colored button
+    with no image at all. Falls back to the first shape with a non-empty
+    `image.path` if none is explicitly flagged background. Env-var tokens
+    (`$DWPICKER_PROJECT_DIRECTORY/...`) are expanded the same way
+    `fix_picker_image_paths`'s own existence check does. "" if the file
+    can't be read or no shape has an image. Backs the "Dreamwall Picker"
+    tab's label_picker_image_source_path."""
+    try:
+        with open(picker_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return ""
+
+    fallback = ""
+    for shape in data.get("shapes", []):
+        img_path = shape.get("image.path")
+        if not img_path:
+            continue
+        if shape.get("background"):
+            return os.path.expandvars(img_path)
+        if not fallback:
+            fallback = os.path.expandvars(img_path)
+    return fallback
+
+
 def get_dreamwall_picker_dir() -> Path | None:
     """Resolve physical path for 'DreamwallPicker' Custom Path using active repo."""
     project, repo, repo_path = repo_paths.get_active_repo()
     if not (project and repo and repo_path):
         print(f"{_LOG_PREFIX} No active project/repo found in UkoreHub.")
         return None
+
+    _sync_dwpicker_project_directory_env(repo_path)
 
     custom_paths = repo_paths.get_custom_paths(project.id, repo.id)
     target_cp = None
@@ -185,15 +244,51 @@ def _find_image_in_dir(directory: Path, filename: str) -> Path | None:
     return None
 
 
-def fix_picker_image_paths(picker_path: Path) -> bool:
-    """Repath any missing shape 'image.path' entries to a same-named file found
-    under this Picker.json's own version folder, so dwpicker's blocking
-    MissingImages dialog never fires for images that simply moved with a
-    publish (dwpicker's add_picker_from_file checks existence right after
-    json.load, before UkoreHub ever gets a chance to intervene). Returns
-    whether anything was actually rewritten — lets callers (e.g. Auto
-    Resolve, which runs this over every character up front) report how many
-    picker files it touched."""
+def _resolve_image_via_project_match(
+    img_path: str, active_repo, projects: list, root_ws: str | None
+) -> Path | None:
+    """Fallback for an `image.path` the same-version-folder search
+    (`_find_image_in_dir`) couldn't find — reuses `matcher.find_match_for_path`
+    /`resolve_redirect`, the exact same project/repo path-matching algorithm
+    `core.py`'s `_classify_path` applies to a broken Maya reference/texture
+    path, since a picker's image was routinely published under the same old
+    absolute Google-Drive convention. `None` if nothing matched, `root_ws`
+    isn't configured, or the match didn't lead anywhere."""
+    if not root_ws:
+        return None
+    clean_path = os.path.normpath(img_path)
+    match = matcher.find_match_for_path(clean_path, projects)
+    if match is None:
+        return None
+    matched_project, matched_repo, match_index = match
+    is_sequence = matcher.has_sequence_token(clean_path)
+    return matcher.resolve_redirect(
+        clean_path, matched_project, matched_repo, match_index, root_ws, is_sequence=is_sequence
+    )
+
+
+def fix_picker_image_paths(
+    picker_path: Path, active_repo=None, projects: list | None = None, root_ws: str | None = None
+) -> bool:
+    """Repath any missing shape 'image.path' entries so dwpicker's blocking
+    MissingImages dialog never fires (dwpicker's add_picker_from_file checks
+    existence right after json.load, before UkoreHub ever gets a chance to
+    intervene). Two passes per missing image, cheapest first:
+
+    1. `_find_image_in_dir` — a same-named file under this Picker.json's own
+       version folder (handles an image simply moved/renamed within the
+       same publish).
+    2. `_resolve_image_via_project_match` — only when (1) misses and
+       `projects` was passed in (callers that already have it fetched;
+       `None` skips this pass entirely rather than looking it up per-shape).
+       Falls back to the same project/repo path-matching algorithm used
+       elsewhere in this plugin, for an image.path still built around the
+       studio's old absolute Google-Drive convention rather than sitting
+       alongside its Picker.json.
+
+    Returns whether anything was actually rewritten — lets callers (e.g.
+    Auto Resolve, which runs this over every character up front) report how
+    many picker files it touched."""
     try:
         with open(picker_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -218,6 +313,8 @@ def fix_picker_image_paths(picker_path: Path) -> bool:
             continue
 
         found = _find_image_in_dir(version_dir, img_filename)
+        if not found and projects is not None:
+            found = _resolve_image_via_project_match(img_path, active_repo, projects, root_ws)
         if not found:
             print(f"{_LOG_PREFIX} Could not auto-resolve missing image: {img_path}")
             continue
@@ -243,7 +340,25 @@ def _matching_namespaces(char_folder: str, scene_namespaces: list[str]) -> list[
     return [ns for ns in scene_namespaces if char_folder.lower() in ns.lower()]
 
 
-def _open_picker_for_character(char_folder: str, picker_path: Path, matching_ns: list[str]) -> None:
+def _repo_match_context() -> tuple:
+    """(active_repo, projects, root_ws) — fetched once per action and
+    threaded through to `fix_picker_image_paths`'s project/repo-matching
+    fallback, same triple `core.py`'s `scan_references`/`scan_textures`
+    fetch once per scan rather than re-querying per shape/entry. Also syncs
+    DWPICKER_PROJECT_DIRECTORY (see `_sync_dwpicker_project_directory_env`)
+    for callers that reach this without having already gone through
+    `get_dreamwall_picker_dir()` (namely `load_picker_for_character`)."""
+    _active_project, active_repo, active_repo_path = repo_paths.get_active_repo()
+    if active_repo_path is not None:
+        _sync_dwpicker_project_directory_env(active_repo_path)
+    projects = repo_paths.list_all_projects()
+    root_ws = repo_paths.workspace_root()
+    return active_repo, projects, root_ws
+
+
+def _open_picker_for_character(
+    char_folder: str, picker_path: Path, matching_ns: list[str], active_repo, projects: list, root_ws: str | None
+) -> None:
     """Fixes `picker_path`'s image paths, opens it in dwpicker, then remaps
     every shape's action targets onto `matching_ns` (the scene namespace
     that owns this character) — the shared per-character step both
@@ -251,7 +366,7 @@ def _open_picker_for_character(char_folder: str, picker_path: Path, matching_ns:
     override use."""
     import dwpicker
 
-    fix_picker_image_paths(picker_path)
+    fix_picker_image_paths(picker_path, active_repo, projects, root_ws)
 
     print(f"{_LOG_PREFIX} Opening picker: {picker_path}")
     dwpicker.open_picker_file(str(picker_path))
@@ -309,6 +424,7 @@ def import_all_picker() -> None:
         dwpicker._dwpicker.clear()
 
     scene_namespaces = _scene_namespaces()
+    active_repo, projects, root_ws = _repo_match_context()
 
     for char_folder in os.listdir(picker_dir):
         char_dir = picker_dir / char_folder
@@ -325,7 +441,7 @@ def import_all_picker() -> None:
         if not picker_path:
             continue
 
-        _open_picker_for_character(char_folder, picker_path, matching_ns)
+        _open_picker_for_character(char_folder, picker_path, matching_ns, active_repo, projects, root_ws)
 
     print(f"{_LOG_PREFIX} Pickers successfully loaded.")
 
@@ -347,7 +463,32 @@ def load_picker_for_character(char_folder: str, picker_path: Path) -> bool:
         return False
 
     matching_ns = _matching_namespaces(char_folder, _scene_namespaces())
-    _open_picker_for_character(char_folder, picker_path, matching_ns)
+    active_repo, projects, root_ws = _repo_match_context()
+    _open_picker_for_character(char_folder, picker_path, matching_ns, active_repo, projects, root_ws)
+    return True
+
+
+def unload_all_pickers() -> bool:
+    """Backs the "Unload" button — the counterpart to Auto Load Picker,
+    closing whatever pickers are currently open in the dwpicker window
+    instead of opening more. Uses `dwpicker.close()` (not just
+    `_dwpicker.clear()`, which `import_all_picker` uses to empty the tabs
+    before reloading) since that's dwpicker's own documented "close
+    properly" entry point — it also unregisters the picker's Maya callbacks,
+    so nothing keeps listening after the artist has explicitly asked to
+    unload. A no-op (returns True) if no picker window is open at all."""
+    try:
+        import dwpicker
+    except ImportError:
+        cmds.warning(f"{_LOG_PREFIX} Error: 'dwpicker' module is not installed or available in Maya.")
+        return False
+
+    if getattr(dwpicker, "_dwpicker", None) is None:
+        print(f"{_LOG_PREFIX} Unload: no picker window currently open.")
+        return True
+
+    dwpicker.close()
+    print(f"{_LOG_PREFIX} Unload: closed the Dreamwall Picker window.")
     return True
 
 
@@ -396,11 +537,12 @@ def auto_resolve_pickers() -> int:
     DreamwallPicker directory knows about instead of only ones already
     matched to something in the current scene. Returns how many Picker.json
     files actually got at least one image path rewritten."""
+    active_repo, projects, root_ws = _repo_match_context()
     fixed = 0
     for entry in scan_pickers():
         if not entry.exists:
             continue
-        if fix_picker_image_paths(Path(entry.picker_path)):
+        if fix_picker_image_paths(Path(entry.picker_path), active_repo, projects, root_ws):
             fixed += 1
     return fixed
 
