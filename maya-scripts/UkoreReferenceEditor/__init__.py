@@ -1,7 +1,25 @@
 import maya.cmds as cmds
 
-try:
-    from UkoreMenu import registry, MenuItemSpec, ReloadHandlerSpec, reload_package
+from UkoreReferenceEditor.picker import register_scene_open_callback
+
+# Registered at import time (mirrors the old standalone dw_publish_picker
+# plugin's own __init__.py) — must already be in place before the very
+# first scene open of the session, so this can't wait for register_menu()
+# below, which needs UkoreMenu itself to be ready (see plugin.py's
+# pre_open_mel hook, which triggers this via a bare `import
+# UkoreReferenceEditor` before UkoreMenu is guaranteed available).
+register_scene_open_callback()
+
+
+def register_menu() -> None:
+    """Registers this plugin's own menu item + reload handler into
+    UkoreMenu — called explicitly from plugin.py's post_open_mel hook
+    (not at import time), since UkoreMenu isn't guaranteed ready yet when
+    pre_open_mel's own early `import UkoreReferenceEditor` runs above."""
+    try:
+        from UkoreMenu import registry, MenuItemSpec, ReloadHandlerSpec, reload_package
+    except ImportError:
+        return
 
     registry.register_item(
         MenuItemSpec(
@@ -20,5 +38,3 @@ try:
             order=21,
         )
     )
-except ImportError:
-    pass

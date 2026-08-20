@@ -17,6 +17,7 @@ get_active_repo = publish_api_paths.get_active_repo
 get_pipeline_refs = publish_api_paths.get_pipeline_refs
 resolve_ref = publish_api_paths.resolve_ref
 get_custom_path = publish_api_paths.get_custom_path
+get_custom_paths = publish_api_paths.get_custom_paths
 
 
 def list_all_projects() -> list:

@@ -35,6 +35,15 @@ def register(api) -> None:
     hooks = bridge.get("launch_hooks", {})
     hooks[TOOL_ID] = {
         "order": 10,  # ให้รัน import ก่อนตัว UkoreMenu (order: 99) จะสั่ง rebuild_menu
-        "post_open_mel": 'python("try:\\n    import UkoreReferenceEditor\\nexcept ImportError:\\n    pass");',
+        # Registers the Dreamwall Picker kAfterOpen callback (picker.py's
+        # register_scene_open_callback, called from __init__.py's own
+        # module-level code) before MayaLauncher's own `file -open`, so the
+        # very first scene open of the session triggers it too — mirrors
+        # the old standalone dw_publish_picker plugin's own pre_open_mel.
+        "pre_open_mel": 'python("try:\\n    import UkoreReferenceEditor\\nexcept ImportError:\\n    pass");',
+        "post_open_mel": (
+            'python("try:\\n    import UkoreReferenceEditor; '
+            'UkoreReferenceEditor.register_menu()\\nexcept ImportError:\\n    pass");'
+        ),
     }
     bridge.set("launch_hooks", hooks)

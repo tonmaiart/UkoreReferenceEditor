@@ -23,10 +23,11 @@ from tmlib.module.PySide import QtCore, QtGui, QtWidgets, wrapInstance
 from tmlib.core import File
 from tmlib.ui import uitools
 
-from UkoreReferenceEditor import core, matcher
+from UkoreReferenceEditor import core, matcher, picker
 
 reload(matcher)
 reload(core)
+reload(picker)
 
 _LOG_PREFIX = "[UkoreReferenceEditor]"
 _UI_PATH = Path(__file__).resolve().parent / "widget.ui"
@@ -60,6 +61,9 @@ _TEX_COL_STATUS, _TEX_COL_FILE, _TEX_COL_SCOPE = range(len(_TEX_COLUMNS))
 
 _AUDIO_COLUMNS = ["Status", "Node Name", "File", "Scope"]
 _AUDIO_COL_STATUS, _AUDIO_COL_NODE, _AUDIO_COL_FILE, _AUDIO_COL_SCOPE = range(len(_AUDIO_COLUMNS))
+
+_PICKER_COLUMNS = ["Status", "Character", "File"]
+_PICKER_COL_STATUS, _PICKER_COL_CHAR, _PICKER_COL_FILE = range(len(_PICKER_COLUMNS))
 
 
 def _get_maya_window():
@@ -625,6 +629,98 @@ class _AudioTab:
         self.reload_table()
 
 
+class _PickerTab:
+    """Wires the "Dreamwall Picker" tab's tableWidget_dreamwall_picker and
+    its Auto Load Picker / Auto Resolve / Change Picker Path... buttons —
+    migrated from the standalone dw_publish_picker plugin (see
+    maya-scripts/UkoreReferenceEditor/picker.py), now living alongside the
+    Maya File/Textures/Audio tabs instead of registering its own separate
+    UkoreMenu item. Auto Load Picker is the direct migration of that old
+    plugin's "Load DW Publish Pickers" menu command (picker.import_all_picker()
+    — scans the whole scene for matching namespaces and opens their
+    pickers); Auto Resolve is this tab's own Rescan, listing every character
+    found under the active repo's DreamwallPicker Custom Path and
+    proactively running picker.fix_picker_image_paths() on each one's
+    resolved Picker.json — the same image-source-path resolution step
+    import_all_picker() runs per-picker, just applied to every character up
+    front instead of only ones already matched in the scene. No separate
+    info panel (unlike the other three tabs) — widget.ui gives this tab
+    only a table + button row."""
+
+    def __init__(self, ui):
+        self.table: QtWidgets.QTableWidget = ui.tableWidget_dreamwall_picker
+        self._entries: list = []
+
+        _set_table_columns(self.table, _PICKER_COLUMNS, stretch_column="File")
+
+        ui.pushButton_change_picker_path_auto_load_picker.clicked.connect(self._on_auto_load_picker)
+        ui.pushButton_auto_resolve_picker_path.clicked.connect(self._on_auto_resolve)
+        ui.pushButton_change_picker_path.clicked.connect(self._on_change_picker_path)
+
+    def reload_table(self):
+        print(f"{_LOG_PREFIX} [Dreamwall Picker] scanning...")
+        try:
+            self._entries = picker.scan_pickers()
+        except Exception as exc:
+            traceback.print_exc()
+            cmds.warning(f"{_LOG_PREFIX} [Dreamwall Picker] Scan failed: {exc}")
+            self.table.setRowCount(0)
+            return
+
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self._entries))
+            for row, entry in enumerate(self._entries):
+                status_item = QtWidgets.QTableWidgetItem(_STATUS_LABELS.get(entry.status, entry.status))
+                status_item.setIcon(_status_icon(entry.status))
+                self.table.setItem(row, _PICKER_COL_STATUS, status_item)
+
+                self.table.setItem(row, _PICKER_COL_CHAR, QtWidgets.QTableWidgetItem(entry.char_name))
+
+                filename_item = QtWidgets.QTableWidgetItem(
+                    Path(entry.picker_path).name if entry.picker_path else ""
+                )
+                filename_item.setToolTip(entry.picker_path or "")
+                self.table.setItem(row, _PICKER_COL_FILE, filename_item)
+        finally:
+            self.table.blockSignals(False)
+
+    def _on_auto_load_picker(self):
+        picker.import_all_picker()
+        self.reload_table()
+
+    def _on_auto_resolve(self):
+        fixed = picker.auto_resolve_pickers()
+        print(f"{_LOG_PREFIX} [Dreamwall Picker] Auto Resolve: fixed image paths in {fixed} picker(s).")
+        self.reload_table()
+
+    def _on_change_picker_path(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            cmds.warning(f"{_LOG_PREFIX} [Dreamwall Picker] Change Picker Path...: select exactly one character.")
+            return
+        entry = self._entries[rows[0]]
+
+        starting_dir = str(Path(entry.picker_path).parent) if entry.picker_path else ""
+        chosen = cmds.fileDialog2(
+            fileMode=1,
+            dialogStyle=2,
+            caption="Change Picker Path...",
+            fileFilter="Picker JSON (*.json);;All Files (*.*)",
+            okCaption="Select",
+            startingDirectory=starting_dir,
+        )
+        if not chosen:
+            return
+
+        ok = picker.load_picker_for_character(entry.char_name, Path(chosen[0]))
+        print(
+            f"{_LOG_PREFIX} [Dreamwall Picker] Change Picker Path...: "
+            f"{entry.char_name!r} -> {chosen[0]!r} returned {ok}"
+        )
+        self.reload_table()
+
+
 class MainWindow(MayaQWidgetDockableMixin, QtWidgets.QMainWindow):
     WINDOW_OBJECT = "UkoreReferenceEditor"
 
@@ -662,15 +758,18 @@ class MainWindow(MayaQWidgetDockableMixin, QtWidgets.QMainWindow):
         self.reference_tab = _ReferenceTab(self.ui)
         self.texture_tab = _TextureTab(self.ui)
         self.audio_tab = _AudioTab(self.ui)
+        self.picker_tab = _PickerTab(self.ui)
 
         self.ui.pushButton_refresh_status.clicked.connect(self._on_refresh_all)
 
         self.reference_tab.reload_table()
         self.texture_tab.reload_table()
         self.audio_tab.reload_table()
+        self.picker_tab.reload_table()
 
     def _on_refresh_all(self):
-        print(f"{_LOG_PREFIX} Refresh Status: rescanning Maya File, Textures, and Audio...")
+        print(f"{_LOG_PREFIX} Refresh Status: rescanning Maya File, Textures, Audio, and Dreamwall Picker...")
         self.reference_tab.reload_table()
         self.texture_tab.reload_table()
         self.audio_tab.reload_table()
+        self.picker_tab.reload_table()

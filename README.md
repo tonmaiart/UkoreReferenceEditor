@@ -3,8 +3,8 @@
 Maya-side tool (originally built as `ReferenceRedirector`, renamed
 2026-08-03) that fixes broken/outdated file paths in a Maya scene — both
 Maya **file references** and **file-texture nodes'** own `fileTextureName`
-paths — via a two-tab table UI ("Maya File", "Textures"). Two independent
-problems it handles:
+paths — via a multi-tab table UI ("Maya File", "Textures", "Audio",
+"Dreamwall Picker"). Three independent problems it handles:
 
 1. **Redirecting** references/textures built around the studio's old
    absolute Google-Drive path convention (e.g.
@@ -19,6 +19,14 @@ problems it handles:
    folder) sitting next to it, absorbing `plugins/repo_internal/MayaToolkit`'s old
    "Update All Reference and Picker" menu action (see "Version checking"
    below).
+3. **Dreamwall Picker loading** (`maya-scripts/UkoreReferenceEditor/picker.py`,
+   merged in 2026-08-20 from the standalone `dw_publish_picker` plugin) —
+   auto-detects character namespaces in the scene and loads their published
+   Dreamwall Pickers from the active repo's `DreamwallPicker` Custom Path,
+   fixing any missing picker-image source paths right after. Unlike the
+   first two problems, this one has its own path-resolution algorithm
+   (Custom-Path-driven, not `matcher.find_match_for_path`/`resolve_redirect`)
+   — kept unchanged from the standalone plugin, see "Dreamwall Picker" below.
 
 Like every other Maya tool plugin here, it has no UI of its own inside
 UkoreHub and does not launch Maya — `plugin.py`'s `register(api)` just
@@ -28,7 +36,12 @@ contributes `PYTHONPATH` (its own `maya-scripts/`, plus `api.app_root` so
 `PluginConfigStore` — see that plugin's README for the full bridge shape.
 This also means it can be turned off per-repo via Repository Setting >
 Enable Plugin (`Repo.required_plugin_ids`) like any other tool, with zero
-extra code here.
+extra code here. One exception: the Dreamwall Picker feature registers its
+own independent `kAfterOpen` scene-open callback directly (`picker.py`'s
+`register_scene_open_callback`, triggered via `plugin.py`'s own
+`pre_open_mel` hook — same mechanism the standalone `dw_publish_picker`
+plugin used), rather than going through `MayaToolkit`'s shared dispatcher
+the way the reference/texture/audio auto-fix below does.
 
 The actual UI entry point ("Ukore Reference Editor...") and the automatic
 scene-open check both live in
@@ -272,6 +285,73 @@ open instead of having to open it by hand. A scene with no references and
 no missing textures at all opens with no popup, same as before this
 behavior existed.
 
+## Dreamwall Picker
+
+`picker.py`'s `get_dreamwall_picker_dir()` resolves the active repo's
+`DreamwallPicker` Custom Path (`PublishApi.repo_paths.get_custom_paths`,
+matched by id/label containing "dreamwallpicker"/"dreamwall picker") to a
+folder of `<character>/vNNN/Picker.json` publishes — this lookup, and
+`get_available_picker_versions`/`resolve_picker_file`'s vNNN-folder
+resolution under it, are carried over unchanged from the standalone
+`dw_publish_picker` plugin this merge absorbed, not reimplemented against
+`matcher`'s project/repo path-matching algorithm (a Dreamwall Picker isn't
+a broken Maya reference/texture path — its location is config-driven via
+the Custom Path, not recovered from a stale absolute path).
+
+- **Auto Load Picker** (`pushButton_change_picker_path_auto_load_picker`)
+  — `picker.import_all_picker()`, the direct migration of the standalone
+  plugin's old "Load DW Publish Pickers" UkoreMenu item (now a button here
+  instead — see "Merged from dw_publish_picker" below). Scans every
+  character folder under the Dreamwall Picker directory against the
+  scene's namespaces/node names; for each match, resolves the picker file
+  (prompting a version-choice dialog when more than one `vNNN` exists),
+  fixes its image paths (see below), opens it in `dwpicker`, and remaps
+  its shapes' `action.targets` onto the matching namespace.
+- **Auto Resolve** (`pushButton_auto_resolve_picker_path`) — this tab's own
+  Rescan: `picker.scan_pickers()` lists every character folder found (not
+  just ones matched in the current scene) with its latest-version picker
+  path, then `picker.auto_resolve_pickers()` runs `fix_picker_image_paths`
+  on each one that resolved — the same image-source-path fix Auto Load
+  Picker applies per-character, just proactive and scene-independent.
+- **Change Picker Path...** (`pushButton_change_picker_path`) — manual
+  override for the selected row: `cmds.fileDialog2(fileMode=1, ...)` picks
+  a specific `Picker.json` directly (skipping the version dialog), which
+  `picker.load_picker_for_character` then opens the same way Auto Load
+  Picker's per-character step does.
+
+**Resolving picker image source paths** — `fix_picker_image_paths(picker_path)`
+rewrites any shape's `image.path` entry that doesn't exist on disk (env
+vars expanded first, e.g. `$DWPICKER_PROJECT_DIRECTORY/...`) to a
+same-named file found via a recursive search under that Picker.json's own
+version folder — this runs automatically after every picker path
+resolution (both Auto Load Picker's per-character loop and Auto Resolve's
+proactive sweep), so `dwpicker`'s own blocking MissingImages dialog never
+fires for an image that simply moved with a publish. Returns whether it
+actually rewrote anything, so Auto Resolve can report how many picker
+files it touched.
+
+The `tableWidget_dreamwall_picker` table has no separate "File Info" panel
+(unlike the other three tabs) — just Status/Character/File columns, File
+being `QHeaderView.Stretch` with the full path in its tooltip, same
+filename-only-plus-tooltip convention the other tabs' File column uses.
+
+**Merged from dw_publish_picker (2026-08-20)** — this feature used to be
+its own standalone plugin (`dw_publish_picker`, contributing its own
+`maya-scripts/DwPublishPicker/` to the bridge and registering a "Load DW
+Publish Pickers" UkoreMenu item). It was folded into UkoreReferenceEditor
+so both tools share one bridge contribution/PYTHONPATH entry instead of
+two, and its menu item was replaced by the Auto Load Picker button above.
+The automatic scene-open auto-load (`auto_import_all_picker`, silent
+unless the scene actually has a matching character) was preserved as-is —
+`picker.py`'s `register_scene_open_callback()` now runs from
+`UkoreReferenceEditor/__init__.py`'s own module-level code (mirroring the
+old plugin's `__init__.py`), triggered early via `plugin.py`'s
+`pre_open_mel` hook rather than at menu-registration time, since it must
+already be registered before the very first scene open of the session —
+see `__init__.py`'s own comment for why this had to be split from
+`register_menu()` (which still needs `UkoreMenu` itself ready, so it stays
+on `post_open_mel` instead).
+
 ## Files
 
 - `manifest.json` / `plugin.py` — bridge contribution, see above.
@@ -309,10 +389,20 @@ behavior existed.
   `ukoreMaya.py`'s `kAfterOpen` callback calls, applying the shared
   `_sort_for_auto_fix`/`_confirm_redirect` policy to both lists — missing
   entries only, never outdated ones).
+- `maya-scripts/UkoreReferenceEditor/picker.py` — Dreamwall Picker loading,
+  merged in from the standalone `dw_publish_picker` plugin — see "Dreamwall
+  Picker" above for the full breakdown (`get_dreamwall_picker_dir`,
+  `PickerVersionDialog`, `resolve_picker_file`/`get_available_picker_versions`,
+  `fix_picker_image_paths`, `import_all_picker`/`load_picker_for_character`,
+  `scan_pickers`/`auto_resolve_pickers`, `register_scene_open_callback`).
 - `maya-scripts/UkoreReferenceEditor/interface.py` — `MainWindow`, a
-  `QTabWidget` with two tabs ("Maya File", "Textures"), each an
-  `_EntryTable` instance wired to the matching `scan_*`/`redirect_*`/
-  `update_version_*` triple (`File.launch("UkoreReferenceEditor")`).
+  `QTabWidget` with four tabs ("Maya File", "Textures", "Audio", "Dreamwall
+  Picker"), each backed by its own class wired to the matching module-level
+  functions: `_ReferenceTab`/`_TextureTab`/`_AudioTab` (`core.py`'s
+  `scan_*`/`redirect_*`/`update_version_*` triple) and `_PickerTab`
+  (`picker.py`'s `scan_pickers`/`import_all_picker`/`auto_resolve_pickers`/
+  `load_picker_for_character` — see "Dreamwall Picker" above). `File.launch(
+  "UkoreReferenceEditor")` is the shared entry point for all four.
   Maya File tab columns: Loaded (checkbox, leftmost), Status (icon —
   `icons8-check-mark-48.png`/`icons8-cancel-48.png`/`icons8-update-48.png`,
   from this plugin's own `maya-scripts/UkoreReferenceEditor/icons/`), File
