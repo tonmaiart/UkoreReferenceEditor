@@ -631,21 +631,21 @@ class _AudioTab:
 
 class _PickerTab:
     """Wires the "Dreamwall Picker" tab's tableWidget_dreamwall_picker and
-    its Unload / Change Path... / Auto Load Picker / Auto Resolve Picker
-    Path buttons — migrated from the standalone dw_publish_picker plugin
-    (see maya-scripts/UkoreReferenceEditor/picker.py), now living alongside
-    the Maya File/Textures/Audio tabs instead of registering its own
-    separate UkoreMenu item. Auto Load Picker is the direct migration of
-    that old plugin's "Load DW Publish Pickers" menu command
+    its Unload / Change Path... / Auto Load Picker buttons — migrated from
+    the standalone dw_publish_picker plugin (see
+    maya-scripts/UkoreReferenceEditor/picker.py), now living alongside the
+    Maya File/Textures/Audio tabs instead of registering its own separate
+    UkoreMenu item. Auto Load Picker is the direct migration of that old
+    plugin's "Load DW Publish Pickers" menu command
     (picker.import_all_picker() — scans the whole scene for matching
-    namespaces and opens their pickers); Unload is its counterpart
+    namespaces and opens their pickers, resolving each shape's image.path
+    in-memory as it opens); Unload is its counterpart
     (picker.unload_all_pickers() — closes the dwpicker window rather than
-    opening more). Auto Resolve Picker Path is this tab's own Rescan,
-    listing every character found under the active repo's DreamwallPicker
-    Custom Path and proactively running picker.fix_picker_image_paths() on
-    each one's resolved Picker.json — the same image-source-path resolution
-    step import_all_picker() runs per-picker, just applied to every
-    character up front instead of only ones already matched in the scene.
+    opening more). There used to be a fourth "Auto Resolve Picker Path"
+    button that proactively rewrote every character's Picker.json on disk
+    ahead of time — removed since Picker.json is meant to stay read-only
+    and Auto Load Picker's in-memory resolution already covers the same
+    ground once a picker is actually opened.
     Info panel is two plain QLabels (label_picker_path/
     label_picker_image_source_path), not the QLineEdit trio the other three
     tabs use — the selected character's own Picker.json path, and the
@@ -665,8 +665,7 @@ class _PickerTab:
         self._label_picker_image_source_path = ui.label_picker_image_source_path
         self._clear_info_panel()
 
-        ui.pushButton_change_picker_path_auto_load_picker.clicked.connect(self._on_auto_load_picker)
-        ui.pushButton_auto_resolve_picker_path.clicked.connect(self._on_auto_resolve)
+        ui.pushButton_auto_load_picker.clicked.connect(self._on_auto_load_picker)
         ui.pushButton_change_picker_path.clicked.connect(self._on_change_picker_path)
         ui.pushButton_unload_picker.clicked.connect(self._on_unload_picker)
 
@@ -720,11 +719,6 @@ class _PickerTab:
 
     def _on_unload_picker(self):
         picker.unload_all_pickers()
-
-    def _on_auto_resolve(self):
-        fixed = picker.auto_resolve_pickers()
-        print(f"{_LOG_PREFIX} [Dreamwall Picker] Auto Resolve: fixed image paths in {fixed} picker(s).")
-        self.reload_table()
 
     def _on_change_picker_path(self):
         rows = _selected_rows(self.table)

@@ -50,7 +50,7 @@
    <item row="1" column="0">
     <widget class="QTabWidget" name="tabWidget">
      <property name="currentIndex">
-      <number>3</number>
+      <number>1</number>
      </property>
      <widget class="QWidget" name="tab">
       <attribute name="title">
@@ -500,16 +500,9 @@
           </spacer>
          </item>
          <item>
-          <widget class="QPushButton" name="pushButton_change_picker_path_auto_load_picker">
+          <widget class="QPushButton" name="pushButton_auto_load_picker">
            <property name="text">
             <string>Auto Load Picker</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="pushButton_auto_resolve_picker_path">
-           <property name="text">
-            <string>Auto Resolve Picker Path</string>
            </property>
           </widget>
          </item>
@@ -535,6 +528,12 @@
    </item>
    <item row="0" column="0">
     <widget class="QPushButton" name="pushButton_refresh_status">
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>30</height>
+      </size>
+     </property>
      <property name="text">
       <string>Refresh</string>
      </property>

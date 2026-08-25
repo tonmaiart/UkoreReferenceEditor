@@ -298,21 +298,21 @@ resolution under it, are carried over unchanged from the standalone
 a broken Maya reference/texture path — its location is config-driven via
 the Custom Path, not recovered from a stale absolute path).
 
-- **Auto Load Picker** (`pushButton_change_picker_path_auto_load_picker`)
+- **Auto Load Picker** (`pushButton_auto_load_picker`)
   — `picker.import_all_picker()`, the direct migration of the standalone
   plugin's old "Load DW Publish Pickers" UkoreMenu item (now a button here
   instead — see "Merged from dw_publish_picker" below). Scans every
   character folder under the Dreamwall Picker directory against the
   scene's namespaces/node names; for each match, resolves the picker file
   (prompting a version-choice dialog when more than one `vNNN` exists),
-  fixes its image paths (see below), opens it in `dwpicker`, and remaps
-  its shapes' `action.targets` onto the matching namespace.
-- **Auto Resolve** (`pushButton_auto_resolve_picker_path`) — this tab's own
-  Rescan: `picker.scan_pickers()` lists every character folder found (not
-  just ones matched in the current scene) with its latest-version picker
-  path, then `picker.auto_resolve_pickers()` runs `fix_picker_image_paths`
-  on each one that resolved — the same image-source-path fix Auto Load
-  Picker applies per-character, just proactive and scene-independent.
+  opens it in `dwpicker`, then fixes its image paths in-memory and remaps
+  its shapes' `action.targets` onto the matching namespace (see below).
+  There used to be a separate "Auto Resolve" button
+  (`pushButton_auto_resolve_picker_path`) that proactively rewrote every
+  character's `Picker.json` on disk ahead of time — removed (2026-08-25)
+  once image-path fixing moved in-memory, since Picker.json is meant to
+  stay read-only and Auto Load Picker's own per-character fix already
+  covers the same ground once a picker is actually opened.
 - **Change Picker Path...** (`pushButton_change_picker_path`) — manual
   override for the selected row: `cmds.fileDialog2(fileMode=1, ...)` picks
   a specific `Picker.json` directly (skipping the version dialog), which
@@ -325,10 +325,11 @@ the Custom Path, not recovered from a stale absolute path).
   point, which also unregisters the picker's Maya callbacks. A no-op if no
   picker window is currently open.
 
-**Resolving picker image source paths** — `fix_picker_image_paths(picker_path,
-active_repo, projects, root_ws)` rewrites any shape's `image.path` entry
-that doesn't exist on disk (env vars expanded first, e.g.
-`$DWPICKER_PROJECT_DIRECTORY/...`), in two passes per missing image:
+**Resolving picker image source paths** — `_open_picker_for_character`, after
+`dwpicker.open_picker_file` has already loaded the document into memory,
+walks `picker.document.shapes` and for any shape whose `image.path` doesn't
+exist on disk (env vars expanded first, e.g.
+`$DWPICKER_PROJECT_DIRECTORY/...`) resolves it in two passes:
 
 1. A same-named file found via a recursive search under that Picker.json's
    own version folder (`_find_image_in_dir`) — cheap, handles an image
@@ -346,13 +347,17 @@ that doesn't exist on disk (env vars expanded first, e.g.
    this triple once per scan rather than per entry) — pass `projects=None`
    to skip this second pass entirely.
 
-This runs automatically after every picker path resolution (Auto Load
-Picker's per-character loop, Auto Resolve's proactive sweep, and Change
-Picker Path...'s manual override), so `dwpicker`'s own blocking
-MissingImages dialog never fires for an image that simply moved with a
-publish or still points at the old Drive convention. Returns whether it
-actually rewrote anything, so Auto Resolve can report how many picker
-files it touched.
+A resolved path is written to `shape.options["image.path"]` and applied via
+`shape.synchronize_image()` — in memory only, for the current Maya session.
+`Picker.json` on disk is never touched (previously this ran as
+`fix_picker_image_paths`, which read the raw dict and `json.dump`'d the
+fix straight back to the file — removed 2026-08-25 so a published
+Picker.json stays 100% read-only). This runs automatically after every
+picker open (Auto Load Picker's per-character loop and Change Picker
+Path...'s manual override both funnel through `_open_picker_for_character`),
+so `dwpicker`'s own blocking MissingImages dialog never fires for an image
+that simply moved with a publish or still points at the old Drive
+convention.
 
 **DWPICKER_PROJECT_DIRECTORY** — `picker.py`'s
 `_sync_dwpicker_project_directory_env` sets this env var (dwpicker's own
@@ -374,7 +379,7 @@ shows the fully-expanded path either way, so a still-broken image after
 this can mean either the file is really gone, or it was published with a
 different `DWPICKER_PROJECT_DIRECTORY` root than the repo root assumed
 here — worth confirming against the raw, un-expanded `image.path` in the
-actual Picker.json if Auto Resolve/Auto Load Picker still can't clear it).
+actual Picker.json if Auto Load Picker still can't clear it).
 
 The `tableWidget_dreamwall_picker` table has no separate "File Info" panel
 (unlike the other three tabs) — just Status/Character/File columns, File
@@ -439,14 +444,15 @@ on `post_open_mel` instead).
   merged in from the standalone `dw_publish_picker` plugin — see "Dreamwall
   Picker" above for the full breakdown (`get_dreamwall_picker_dir`,
   `PickerVersionDialog`, `resolve_picker_file`/`get_available_picker_versions`,
-  `fix_picker_image_paths`, `import_all_picker`/`load_picker_for_character`,
-  `scan_pickers`/`auto_resolve_pickers`, `register_scene_open_callback`).
+  `_open_picker_for_character` (in-memory image-path fix),
+  `import_all_picker`/`load_picker_for_character`, `scan_pickers`,
+  `register_scene_open_callback`).
 - `maya-scripts/UkoreReferenceEditor/interface.py` — `MainWindow`, a
   `QTabWidget` with four tabs ("Maya File", "Textures", "Audio", "Dreamwall
   Picker"), each backed by its own class wired to the matching module-level
   functions: `_ReferenceTab`/`_TextureTab`/`_AudioTab` (`core.py`'s
   `scan_*`/`redirect_*`/`update_version_*` triple) and `_PickerTab`
-  (`picker.py`'s `scan_pickers`/`import_all_picker`/`auto_resolve_pickers`/
+  (`picker.py`'s `scan_pickers`/`import_all_picker`/
   `load_picker_for_character` — see "Dreamwall Picker" above). `File.launch(
   "UkoreReferenceEditor")` is the shared entry point for all four.
   Maya File tab columns: Loaded (checkbox, leftmost), Status (icon —

@@ -14,9 +14,11 @@ resolving *which* Picker.json to open is Custom-Path-driven (see
 `resolve_redirect`'s project/repo path-matching. A picker's own embedded
 `image.path` entries are a different story, though — those were commonly
 published under the studio's old absolute Google-Drive convention same as
-any Maya reference/texture, so `fix_picker_image_paths` falls back to that
-exact same `matcher` algorithm (see its own docstring) once the cheaper
-same-version-folder search misses."""
+any Maya reference/texture, so `_open_picker_for_character` falls back to
+that exact same `matcher` algorithm (see its own docstring) once the
+cheaper same-version-folder search misses. That resolution is applied
+in-memory only, after dwpicker has already loaded the document —
+Picker.json itself is never rewritten."""
 
 from __future__ import annotations
 
@@ -75,7 +77,7 @@ def get_picker_background_image_path(picker_path: Path) -> str:
     with no image at all. Falls back to the first shape with a non-empty
     `image.path` if none is explicitly flagged background. Env-var tokens
     (`$DWPICKER_PROJECT_DIRECTORY/...`) are expanded the same way
-    `fix_picker_image_paths`'s own existence check does. "" if the file
+    `_open_picker_for_character`'s own existence check does. "" if the file
     can't be read or no shape has an image. Backs the "Dreamwall Picker"
     tab's label_picker_image_source_path."""
     try:
@@ -267,82 +269,13 @@ def _resolve_image_via_project_match(
     )
 
 
-def fix_picker_image_paths(
-    picker_path: Path, active_repo=None, projects: list | None = None, root_ws: str | None = None
-) -> bool:
-    """Repath any missing shape 'image.path' entries so dwpicker's blocking
-    MissingImages dialog never fires (dwpicker's add_picker_from_file checks
-    existence right after json.load, before UkoreHub ever gets a chance to
-    intervene). Two passes per missing image, cheapest first:
-
-    1. `_find_image_in_dir` — a same-named file under this Picker.json's own
-       version folder (handles an image simply moved/renamed within the
-       same publish).
-    2. `_resolve_image_via_project_match` — only when (1) misses and
-       `projects` was passed in (callers that already have it fetched;
-       `None` skips this pass entirely rather than looking it up per-shape).
-       Falls back to the same project/repo path-matching algorithm used
-       elsewhere in this plugin, for an image.path still built around the
-       studio's old absolute Google-Drive convention rather than sitting
-       alongside its Picker.json.
-
-    Returns whether anything was actually rewritten — lets callers (e.g.
-    Auto Resolve, which runs this over every character up front) report how
-    many picker files it touched."""
-    try:
-        with open(picker_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as err:
-        print(f"{_LOG_PREFIX} Error reading {picker_path}: {err}")
-        return False
-
-    version_dir = picker_path.parent
-    modified = False
-
-    for shape in data.get("shapes", []):
-        img_path = shape.get("image.path")
-        if not img_path:
-            continue
-
-        # dwpicker paths may contain env vars (e.g. $DWPICKER_PROJECT_DIRECTORY/...)
-        if os.path.exists(os.path.expandvars(img_path)):
-            continue
-
-        img_filename = os.path.basename(img_path)
-        if not img_filename:
-            continue
-
-        found = _find_image_in_dir(version_dir, img_filename)
-        if not found and projects is not None:
-            found = _resolve_image_via_project_match(img_path, active_repo, projects, root_ws)
-        if not found:
-            print(f"{_LOG_PREFIX} Could not auto-resolve missing image: {img_path}")
-            continue
-
-        shape["image.path"] = str(found).replace("\\", "/")
-        modified = True
-
-    if not modified:
-        return False
-
-    try:
-        with open(picker_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        print(f"{_LOG_PREFIX} Auto-resolved missing image paths for: {picker_path.name}")
-    except Exception as err:
-        print(f"{_LOG_PREFIX} Warning: Could not rewrite {picker_path}: {err}")
-        return False
-
-    return True
-
-
 def _matching_namespaces(char_folder: str, scene_namespaces: list[str]) -> list[str]:
     return [ns for ns in scene_namespaces if char_folder.lower() in ns.lower()]
 
 
 def _repo_match_context() -> tuple:
     """(active_repo, projects, root_ws) — fetched once per action and
-    threaded through to `fix_picker_image_paths`'s project/repo-matching
+    threaded through to `_open_picker_for_character`'s project/repo-matching
     fallback, same triple `core.py`'s `scan_references`/`scan_textures`
     fetch once per scan rather than re-querying per shape/entry. Also syncs
     DWPICKER_PROJECT_DIRECTORY (see `_sync_dwpicker_project_directory_env`)
@@ -359,14 +292,22 @@ def _repo_match_context() -> tuple:
 def _open_picker_for_character(
     char_folder: str, picker_path: Path, matching_ns: list[str], active_repo, projects: list, root_ws: str | None
 ) -> None:
-    """Fixes `picker_path`'s image paths, opens it in dwpicker, then remaps
-    every shape's action targets onto `matching_ns` (the scene namespace
-    that owns this character) — the shared per-character step both
-    `import_all_picker`'s scan loop and `load_picker_for_character`'s manual
-    override use."""
-    import dwpicker
+    """Opens `picker_path` in dwpicker, then per shape: remaps action
+    targets onto `matching_ns` (the scene namespace that owns this
+    character) and resolves any missing `image.path` in-memory only —
+    the shared per-character step both `import_all_picker`'s scan loop and
+    `load_picker_for_character`'s manual override use.
 
-    fix_picker_image_paths(picker_path, active_repo, projects, root_ws)
+    Image paths are fixed here, after `dwpicker.open_picker_file` has
+    already loaded the document into memory, instead of by rewriting
+    `picker_path` on disk beforehand — Picker.json published under a
+    repo/Custom Path stays 100% read-only; the fix only lives for this
+    Maya session via `shape.options["image.path"]` +
+    `shape.synchronize_image()`. Two-pass lookup: `_find_image_in_dir`
+    (same-version-folder search) first, then
+    `_resolve_image_via_project_match` (project/repo path-matching
+    fallback) if that misses."""
+    import dwpicker
 
     print(f"{_LOG_PREFIX} Opening picker: {picker_path}")
     dwpicker.open_picker_file(str(picker_path))
@@ -376,21 +317,37 @@ def _open_picker_for_character(
         return
 
     new_ns = matching_ns[0] if matching_ns else ""
+    version_dir = picker_path.parent
 
     for shape in picker.document.shapes:
         targets = shape.options.get("action.targets", [])
-        if not targets:
+        if targets:
+            new_targets = []
+            for t in targets:
+                base_name = t.split(":")[-1]
+                if not new_ns or new_ns == ":":
+                    new_targets.append(base_name)
+                else:
+                    new_targets.append(f"{new_ns}:{base_name}")
+            shape.options["action.targets"] = new_targets
+
+        img_path = shape.options.get("image.path")
+        if not img_path or os.path.exists(os.path.expandvars(img_path)):
             continue
 
-        new_targets = []
-        for t in targets:
-            base_name = t.split(":")[-1]
-            if not new_ns or new_ns == ":":
-                new_targets.append(base_name)
-            else:
-                new_targets.append(f"{new_ns}:{base_name}")
+        img_filename = os.path.basename(img_path)
+        if not img_filename:
+            continue
 
-        shape.options["action.targets"] = new_targets
+        found = _find_image_in_dir(version_dir, img_filename)
+        if not found and projects is not None:
+            found = _resolve_image_via_project_match(img_path, active_repo, projects, root_ws)
+        if not found:
+            print(f"{_LOG_PREFIX} Could not auto-resolve missing image: {img_path}")
+            continue
+
+        shape.options["image.path"] = str(found).replace("\\", "/")
+        shape.synchronize_image()
 
     picker.update()
 
@@ -526,25 +483,6 @@ def scan_pickers() -> list[PickerEntry]:
             entries.append(PickerEntry(char_folder, "", False, "missing"))
 
     return entries
-
-
-def auto_resolve_pickers() -> int:
-    """Backs the "Auto Resolve" button — resolves every character's picker
-    path (`scan_pickers` already does the lookup) and, for every one that
-    resolved, runs `fix_picker_image_paths` on it: the same image-source-path
-    resolution step `import_all_picker` runs right after resolving a
-    picker's path, just applied proactively to every character the
-    DreamwallPicker directory knows about instead of only ones already
-    matched to something in the current scene. Returns how many Picker.json
-    files actually got at least one image path rewritten."""
-    active_repo, projects, root_ws = _repo_match_context()
-    fixed = 0
-    for entry in scan_pickers():
-        if not entry.exists:
-            continue
-        if fix_picker_image_paths(Path(entry.picker_path), active_repo, projects, root_ws):
-            fixed += 1
-    return fixed
 
 
 def _scene_has_matching_character(picker_dir: Path) -> bool:
