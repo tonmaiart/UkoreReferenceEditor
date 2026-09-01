@@ -495,8 +495,8 @@ def _connect_input_targets() -> list[Path]:
     """Every filesystem folder the active repo has declared reaching into
     via Project Editor's "Connect Input Path" — an external redirect (of a
     reference or a texture) is only auto-applied when its suggested path
-    falls inside one of these, otherwise it needs a Redirect Now/Skip
-    confirmation. `custom_path["path"]` is stripped of a leading separator
+    falls inside one of these, otherwise it needs a Redirect Now/Redirect
+    All/Skip confirmation. `custom_path["path"]` is stripped of a leading separator
     before joining — raw user input, and an untouched leading "/" silently
     resets a `WindowsPath` join to the current drive root instead of
     extending it (same bug class as
@@ -574,7 +574,11 @@ def auto_fix_entries(entries: list, redirect_fn) -> int:
     return fixed
 
 
-def _confirm_redirect(display_path: str, suggested_path: Path) -> bool:
+def _confirm_redirect(display_path: str, suggested_path: Path) -> str:
+    """Returns "redirect", "all", or "skip" — "all" tells the caller to
+    apply this and every remaining confirm-needed entry (ref/texture/audio
+    alike) without prompting again, so a scene with several external
+    redirects doesn't mean clicking Redirect Now once per file."""
     result = cmds.confirmDialog(
         title=_DIALOG_TITLE,
         message=(
@@ -582,12 +586,16 @@ def _confirm_redirect(display_path: str, suggested_path: Path) -> bool:
             f"{display_path}\n\nSuggested new location:\n{suggested_path}\n\n"
             "Redirect now?"
         ),
-        button=["Redirect Now", "Skip"],
+        button=["Redirect Now", "Redirect All", "Skip"],
         defaultButton="Redirect Now",
         cancelButton="Skip",
         dismissString="Skip",
     )
-    return result == "Redirect Now"
+    if result == "Redirect Now":
+        return "redirect"
+    if result == "Redirect All":
+        return "all"
+    return "skip"
 
 
 def auto_check_and_redirect() -> bool:
@@ -607,7 +615,9 @@ def auto_check_and_redirect() -> bool:
     scan_references and scan_textures through the same policy: internal
     matches and external matches already covered by one of the active
     repo's own Connect Input Path connections redirect immediately with a
-    notification; anything else external gets a Redirect Now/Skip prompt,
+    notification; anything else external gets a Redirect Now/Redirect
+    All/Skip prompt (Redirect All applies to this and every remaining
+    confirm-needed entry across all three lists without prompting again),
     same UX shape as UkoreMaya.core.function.update_references()'s own
     confirmDialog. Only ever acts on *missing* references/textures —
     "outdated" is UI-only, manual (Update Version button), never automatic.
@@ -712,15 +722,26 @@ def auto_check_and_redirect() -> bool:
         lines += [f"- {e.file_path} -> {e.suggested_path}" for e in audio_auto]
         print(f"# {_DIALOG_TITLE} auto-redirected:\n" + "\n".join(lines))
 
+    redirect_all = False
+
+    def _decide(display_path: str, suggested_path: Path) -> bool:
+        nonlocal redirect_all
+        if redirect_all:
+            return True
+        decision = _confirm_redirect(display_path, suggested_path)
+        if decision == "all":
+            redirect_all = True
+        return decision in ("redirect", "all")
+
     for entry in ref_confirm:
-        if _confirm_redirect(entry.ref_path, entry.suggested_path):
+        if _decide(entry.ref_path, entry.suggested_path):
             _deferred_load(redirect_reference, entry.ref_node, entry.suggested_path)
     for entry in texture_confirm:
-        if _confirm_redirect(entry.file_path, entry.suggested_path):
+        if _decide(entry.file_path, entry.suggested_path):
             if redirect_texture(entry.node_name, entry.attr_name, entry.suggested_path):
                 texture_fixed += 1
     for entry in audio_confirm:
-        if _confirm_redirect(entry.file_path, entry.suggested_path):
+        if _decide(entry.file_path, entry.suggested_path):
             if redirect_audio(entry.node_name, entry.attr_name, entry.suggested_path):
                 audio_fixed += 1
 

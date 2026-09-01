@@ -99,6 +99,15 @@ a pure library, the same relationship `PublishApi` has to `MayaPublisher`.
    listed but never auto-acted on. Only ever applied to **missing**
    entries, never outdated ones (see below).
 
+   The automatic `kAfterOpen` path's own confirmation prompt
+   (`core.py`'s `_confirm_redirect`, used by `auto_check_and_redirect` —
+   see "Beating Maya's own native..." below) has three buttons, not two:
+   **Redirect Now** (this entry only), **Redirect All** (this entry and
+   every remaining confirm-needed reference/texture/audio entry across the
+   whole scene, applied without prompting again), and **Skip**. Added so a
+   scene with several external, non-Connect-Input-Path files doesn't mean
+   clicking Redirect Now once per file on open.
+
 **Clicking Rescan itself applies this** — `interface.py`'s
 `_EntryTable.reload_table` calls `core.py`'s `auto_fix_entries` right after
 every scan (both tabs), which silently redirects anything internal or
