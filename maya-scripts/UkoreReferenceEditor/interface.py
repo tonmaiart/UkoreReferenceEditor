@@ -351,7 +351,8 @@ class _ReferenceTab:
 
 class _TextureTab:
     """Wires the "Textures" tab's tableWidget_textures, its Rescan / Find
-    All Missing File... buttons, and its Texture File Info line edits."""
+    All Missing File... / Change Texture File... buttons, and its Texture
+    File Info line edits."""
 
     def __init__(self, ui):
         self.table: QtWidgets.QTableWidget = ui.tableWidget_textures
@@ -371,6 +372,7 @@ class _TextureTab:
 
         ui.pushButton_rescan_texture.clicked.connect(self.reload_table)
         ui.pushButton_find_all_missing_texture.clicked.connect(self._on_find_all_missing)
+        ui.pushButton_change_texture_file.clicked.connect(self._on_change_texture_file)
 
     def reload_table(self):
         print(f"{_LOG_PREFIX} [Textures] scanning...")
@@ -423,6 +425,38 @@ class _TextureTab:
         path.setText(entry.file_path or "")
         status.setText(_STATUS_LABELS.get(entry.status, entry.status))
         scope.setText(_SCOPE_LABELS[entry.scope])
+
+    def _on_change_texture_file(self):
+        rows = _selected_rows(self.table)
+        if len(rows) != 1:
+            cmds.warning(f"{_LOG_PREFIX} [Textures] Change Texture File...: select exactly one texture row.")
+            return
+        entry = self._entries[rows[0]]
+
+        starting_dir = ""
+        if entry.file_path:
+            parent = Path(entry.file_path).parent
+            if parent.is_dir():
+                starting_dir = str(parent)
+
+        chosen = cmds.fileDialog2(
+            fileMode=1,
+            dialogStyle=2,
+            caption="Change Texture File...",
+            okCaption="Select",
+            startingDirectory=starting_dir,
+        )
+        if not chosen:
+            return
+
+        resolved = matcher.resolve_manual_target(entry.file_path, Path(chosen[0]))
+        if resolved is None:
+            cmds.warning(f"{_LOG_PREFIX} [Textures] Change Texture File...: {chosen[0]!r} is not a valid file.")
+            return
+
+        ok = self._redirect(entry, resolved)
+        print(f"{_LOG_PREFIX} [Textures] Change Texture File...: {entry.file_path!r} -> {resolved!r} returned {ok}")
+        self.reload_table()
 
     def _on_find_all_missing(self):
         missing_entries = [e for e in self._entries if e.status == "missing"]
